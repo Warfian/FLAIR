@@ -35,10 +35,47 @@ from ml_dtypes import bfloat16
 
 import aie.iron as iron
 from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.utils import config
 from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
 from aie.utils.hostruntime.cli import run_design_cli
 
-_KERNEL_SRC = str(Path(__file__).parent / "kernels" / "gru_cell.cc")
+_KERNEL_SRC = Path(__file__).parent / "kernels" / "gru_cell.cc"
+
+
+def _make_gru_kernel(arg_types, compile_flags):
+    """Build the gru_cell ExternalFunction with the include wiring the aie2
+    LUT kernels rely on.
+
+    The JIT copies the kernel source into build/<name>.prj/ before compiling,
+    so relative includes in gru_cell.cc break. Instead we:
+      * pass explicit -I dirs (wheel's aie_kernels for aie_kernel_utils.h,
+        aie_runtime_lib/AIE2 for lut_based_ops.h), and
+      * wrap the kernel in a TU that also #includes lut_based_ops.cpp by
+        absolute path, so getTanhBf16's tanh_lut_ab/cd tables are defined
+        (otherwise: undefined-symbol link error).
+
+    This mirrors aie.iron.kernels.activation._create_lut_kernel's aie2 path.
+    Hardcoded to AIE2 because this design targets Phoenix (XDNA1) and the
+    kernel uses the AIE2 getTanhBf16 primitive.
+    """
+    header_base = Path(config.cxx_header_path())
+    runtime_dir = Path(config.root_path()) / "aie_runtime_lib" / "AIE2"
+    lut_cpp = runtime_dir / "lut_based_ops.cpp"
+
+    include_dirs = [
+        str(header_base),                    # aie_api/aie.hpp etc.
+        str(header_base / "aie_kernels"),    # aie_kernel_utils.h
+        str(runtime_dir),                    # lut_based_ops.h
+    ]
+    source = f'#include "{_KERNEL_SRC}"\n#include "{lut_cpp}"\n'
+
+    return ExternalFunction(
+        "gru_cell_encoder_bf16",
+        source_string=source,
+        arg_types=arg_types,
+        include_dirs=include_dirs,
+        compile_flags=compile_flags,
+    )
 
 # Dims from the trained checkpoint (experiments/results/flair_minimal.pt):
 # encoder.gru.weight_ih_l0: (192, 45) -> INPUT_DIM=45, HIDDEN_DIM=64
@@ -64,9 +101,7 @@ def gru_cell_encoder(
     h_ty = np.ndarray[(hidden_dim,), dtype]
     params_ty = np.ndarray[(n_params,), dtype]
 
-    gru_kernel = ExternalFunction(
-        "gru_cell_encoder_bf16",
-        source_file=_KERNEL_SRC,
+    gru_kernel = _make_gru_kernel(
         arg_types=[x_ty, h_ty, params_ty, h_ty],
         compile_flags=[f"-DINPUT_DIM={input_dim}", f"-DHIDDEN_DIM={hidden_dim}"],
     )

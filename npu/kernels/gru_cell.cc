@@ -39,7 +39,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "../../aie_kernel_utils.h"
+// These are resolved via -I include dirs passed by the IRON driver
+// (gru_cell_encoder.py), NOT via relative paths: the JIT copies this
+// source into build/<name>.prj/ before compiling, so a path like
+// "../../aie_kernel_utils.h" would not resolve. The driver adds the wheel's
+// aie_kernels dir (for aie_kernel_utils.h) and aie_runtime_lib/AIE2 dir
+// (for lut_based_ops.h) to the include path, and compiles lut_based_ops.cpp
+// into the same TU so getTanhBf16's tanh_lut tables are defined.
+#include "aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
 #include <lut_based_ops.h>
 #include <stdint.h>
