@@ -44,6 +44,11 @@ all: ${xclbin_target} ${insts_target} data
 # (i) Compile the @iron.jit design to xclbin + insts (WSL, no NPU needed).
 $(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${devicename} --input-dim ${INPUT_DIM} --hidden-dim ${HIDDEN_DIM}))
 
+# jit_xclbin only lists the .py driver as a prerequisite, so edits to the
+# kernel .cc would NOT trigger an xclbin rebuild. Add the kernel source as an
+# explicit prerequisite of the xclbin so `make` recompiles when it changes.
+${xclbin_target} ${insts_target}: ${srcdir}/kernels/gru_cell.cc
+
 # (ii) Build the host test.exe (Windows, via cmake/powershell).
 $(eval $(call build_host_exe,${targetname},_build,test.cpp,${XRT_FLAGS} -DINPUT_DIM=${INPUT_DIM} -DHIDDEN_DIM=${HIDDEN_DIM}))
 
