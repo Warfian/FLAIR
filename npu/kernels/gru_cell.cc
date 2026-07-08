@@ -172,8 +172,16 @@ void gru_cell_encoder_impl(bfloat16 *restrict x_in, bfloat16 *restrict h_prev,
 
 extern "C" {
 
-void gru_cell_encoder_bf16(bfloat16 *x_in, bfloat16 *h_prev,
-                           bfloat16 *params, bfloat16 *h_next) {
+// state buffer = [x_in (INPUT_DIM) | h_prev (HIDDEN_DIM)] concatenated.
+// x_in and h_prev are bundled into one input so the compute tile stays
+// within its 2-input DMA-channel budget: x_in + h_prev + params as three
+// separate input ObjectFifos would need 3 input channels, but each AIE
+// core tile has only 2 in / 2 out. state + params = 2 inputs, h_next = 1
+// output, which fits.
+void gru_cell_encoder_bf16(bfloat16 *state, bfloat16 *params,
+                           bfloat16 *h_next) {
+  bfloat16 *x_in = state;
+  bfloat16 *h_prev = state + INPUT_DIM;
   gru_cell_encoder_impl(x_in, h_prev, params, h_next);
 }
 

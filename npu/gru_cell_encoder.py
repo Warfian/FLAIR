@@ -85,50 +85,50 @@ HIDDEN_DIM = 64
 
 @iron.jit
 def gru_cell_encoder(
-    x_in: In,
-    h_prev: In,
+    state: In,
     params: In,
     h_next: Out,
     *,
     input_dim: CompileTime[int] = INPUT_DIM,
     hidden_dim: CompileTime[int] = HIDDEN_DIM,
 ):
+    # state = [x_in (input_dim) | h_prev (hidden_dim)] concatenated into one
+    # input buffer. x_in and h_prev are bundled so the compute tile stays
+    # within its 2-input DMA-channel budget: state + params = 2 inputs,
+    # h_next = 1 output (each AIE core tile has only 2 in / 2 out channels).
     h3 = 3 * hidden_dim
     n_params = h3 * input_dim + h3 * hidden_dim + h3 + h3
+    state_len = input_dim + hidden_dim
     dtype = np.dtype[bfloat16]
 
-    x_ty = np.ndarray[(input_dim,), dtype]
+    state_ty = np.ndarray[(state_len,), dtype]
     h_ty = np.ndarray[(hidden_dim,), dtype]
     params_ty = np.ndarray[(n_params,), dtype]
 
     gru_kernel = _make_gru_kernel(
-        arg_types=[x_ty, h_ty, params_ty, h_ty],
+        arg_types=[state_ty, params_ty, h_ty],
         compile_flags=[f"-DINPUT_DIM={input_dim}", f"-DHIDDEN_DIM={hidden_dim}"],
     )
 
-    x_fifo = ObjectFifo(x_ty, name="x_in")
-    h_fifo = ObjectFifo(h_ty, name="h_prev")
+    state_fifo = ObjectFifo(state_ty, name="state")
     params_fifo = ObjectFifo(params_ty, name="params")
     hnext_fifo = ObjectFifo(h_ty, name="h_next")
 
-    def core_fn(x_c, h_c, params_c, hnext_p, kernel):
-        elem_x = x_c.acquire(1)
-        elem_h = h_c.acquire(1)
+    def core_fn(state_c, params_c, hnext_p, kernel):
+        elem_state = state_c.acquire(1)
         elem_params = params_c.acquire(1)
         elem_out = hnext_p.acquire(1)
 
-        kernel(elem_x, elem_h, elem_params, elem_out)
+        kernel(elem_state, elem_params, elem_out)
 
-        x_c.release(1)
-        h_c.release(1)
+        state_c.release(1)
         params_c.release(1)
         hnext_p.release(1)
 
     worker = Worker(
         core_fn,
         [
-            x_fifo.cons(),
-            h_fifo.cons(),
+            state_fifo.cons(),
             params_fifo.cons(),
             hnext_fifo.prod(),
             gru_kernel,
@@ -136,15 +136,13 @@ def gru_cell_encoder(
     )
 
     rt = Runtime()
-    with rt.sequence(x_ty, h_ty, params_ty, h_ty) as (
-        x_arg,
-        h_arg,
+    with rt.sequence(state_ty, params_ty, h_ty) as (
+        state_arg,
         params_arg,
         hnext_arg,
     ):
         rt.start(worker)
-        rt.fill(x_fifo.prod(), x_arg)
-        rt.fill(h_fifo.prod(), h_arg)
+        rt.fill(state_fifo.prod(), state_arg)
         rt.fill(params_fifo.prod(), params_arg)
         rt.drain(hnext_fifo.cons(), hnext_arg, wait=True)
 
@@ -179,7 +177,11 @@ def _load_inputs_from_checkpoint():
 
     h_prev = np.zeros(HIDDEN_DIM, dtype=bfloat16)
 
-    return x_in, h_prev, params
+    # Concatenate into the single `state` buffer the kernel expects:
+    # [x_in (INPUT_DIM) | h_prev (HIDDEN_DIM)].
+    state = np.concatenate([x_in, h_prev]).astype(bfloat16)
+
+    return state, params
 
 
 def _make_argparser():
@@ -205,15 +207,14 @@ def _run_and_verify(opts):
     the NPU. In the WSL compile-only flow this function is never called;
     run_design_cli dispatches to compile-only whenever --xclbin-path is set.
     """
-    x_in, h_prev, params = _load_inputs_from_checkpoint()
+    state, params = _load_inputs_from_checkpoint()
 
-    x_t = iron.tensor(x_in, dtype=bfloat16, device="npu")
-    h_t = iron.tensor(h_prev, dtype=bfloat16, device="npu")
+    state_t = iron.tensor(state, dtype=bfloat16, device="npu")
     params_t = iron.tensor(params, dtype=bfloat16, device="npu")
     hnext_t = iron.zeros(HIDDEN_DIM, dtype=bfloat16, device="npu")
 
     gru_cell_encoder(
-        x_t, h_t, params_t, hnext_t,
+        state_t, params_t, hnext_t,
         input_dim=opts.input_dim, hidden_dim=opts.hidden_dim,
     )
 
