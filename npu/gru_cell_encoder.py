@@ -98,7 +98,13 @@ def gru_cell_encoder(
     # h_next = 1 output (each AIE core tile has only 2 in / 2 out channels).
     h3 = 3 * hidden_dim
     n_params = h3 * input_dim + h3 * hidden_dim + h3 + h3
-    state_len = input_dim + hidden_dim
+    # NPU shim DMA transfers must be 4-byte aligned. For bf16 (2 bytes/elem)
+    # that means an even element count. input_dim + hidden_dim = 45 + 64 =
+    # 109 is odd, so pad the state buffer up to the next even length. The
+    # kernel only reads the first input_dim + hidden_dim elements; the
+    # trailing pad element is ignored.
+    state_len_unpadded = input_dim + hidden_dim
+    state_len = state_len_unpadded + (state_len_unpadded % 2)
     dtype = np.dtype[bfloat16]
 
     state_ty = np.ndarray[(state_len,), dtype]
@@ -178,8 +184,11 @@ def _load_inputs_from_checkpoint():
     h_prev = np.zeros(HIDDEN_DIM, dtype=bfloat16)
 
     # Concatenate into the single `state` buffer the kernel expects:
-    # [x_in (INPUT_DIM) | h_prev (HIDDEN_DIM)].
+    # [x_in (INPUT_DIM) | h_prev (HIDDEN_DIM)], padded to an even length to
+    # satisfy the 4-byte DMA alignment (see the design body's state_len note).
     state = np.concatenate([x_in, h_prev]).astype(bfloat16)
+    if state.size % 2 != 0:
+        state = np.concatenate([state, np.zeros(1, dtype=bfloat16)])
 
     return state, params
 
