@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "xrt_test_wrapper.h"
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <vector>
@@ -69,6 +70,8 @@ void initialize_bufOut(bf16 *buf, int SIZE) {
 
 // NOTE: the wrapper passes IN1_VOLUME (the state length) as `SIZE`, not the
 // output length -- so we loop over HIDDEN_DIM (the real h_next length) here.
+// out[i] is a raw bf16 (uint16 bits on MSVC); convert with bfloat16_to_float,
+// NOT static_cast (which would give the integer bit value).
 int verify_gru(bf16 *state, bf16 *params, bf16 *out, int /*SIZE*/,
                int verbosity) {
   (void)state;
@@ -76,19 +79,20 @@ int verify_gru(bf16 *state, bf16 *params, bf16 *out, int /*SIZE*/,
   int errors = 0;
   float max_abs = 0.0f;
   for (int i = 0; i < HIDDEN_DIM; i++) {
-    float got = static_cast<float>(out[i]);
+    float got = test_utils::bfloat16_to_float(out[i]);
     float ref = g_golden[i];
     float d = std::abs(got - ref);
-    if (d > max_abs)
+    if (std::isfinite(got) && d > max_abs)
       max_abs = d;
-    if (d > VERIFY_ATOL) {
+    if (!std::isfinite(got) || d > VERIFY_ATOL) {
       errors++;
       if (verbosity >= 1)
-        std::cout << "  mismatch[" << i << "]: got " << got << " ref " << ref
-                  << " (|d|=" << d << ")\n";
+        std::cout << "  mismatch[" << i << "]: got " << got << " (0x"
+                  << std::hex << static_cast<unsigned>(out[i]) << std::dec
+                  << ") ref " << ref << " (|d|=" << d << ")\n";
     }
   }
-  std::cout << "h_next max abs error vs golden: " << max_abs
+  std::cout << "h_next max abs error vs golden (finite): " << max_abs
             << "  (atol=" << VERIFY_ATOL << ", " << errors << "/" << HIDDEN_DIM
             << " over tol)\n";
   return errors;

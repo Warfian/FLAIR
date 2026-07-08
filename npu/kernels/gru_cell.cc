@@ -129,6 +129,17 @@ void gru_cell_encoder_impl(bfloat16 *restrict x_in, bfloat16 *restrict h_prev,
   matvec_bias(w_ih, x_in, b_ih, gi, H3, INPUT_DIM);
   matvec_bias(w_hh, h_prev, b_hh, gh, H3, H);
 
+  // h_prev points INTO the DMA'd state buffer at element offset INPUT_DIM
+  // (=45), i.e. 90 bytes -- NOT a 32-byte vector boundary. A direct
+  // aie::load_v<16>(h_prev + i) in the combine loop below reads misaligned /
+  // wrong memory (garbage, incl. NaN bit patterns), corrupting the z*h_prev
+  // term. Copy h_prev (scalar reads are alignment-agnostic) into an aligned
+  // local buffer so the vector loads are correct. gi/gh are already aligned
+  // (declared alignas above), so only h_prev needs this.
+  alignas(aie::vector_decl_align) bfloat16 h_local[H];
+  for (int i = 0; i < H; i++)
+    h_local[i] = h_prev[i];
+
   bfloat16 *gi_r = gi;
   bfloat16 *gi_z = gi + H;
   bfloat16 *gi_n = gi + 2 * H;
@@ -157,7 +168,7 @@ void gru_cell_encoder_impl(bfloat16 *restrict x_in, bfloat16 *restrict h_prev,
     aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
     aie::vector<bfloat16, 16> n = getTanhBf16(n_pre);
 
-    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
+    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_local + i);
     aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
     aie::vector<bfloat16, 16> one_minus_z = aie::sub(one, z);
     aie::vector<bfloat16, 16> term1 = aie::mul(one_minus_z, n);
