@@ -1,0 +1,89 @@
+# -------------------------------
+# FLAIR Configuration (Flow CSV)
+# WUSTL-IIoT: use the 23 Table III features
+# -------------------------------
+
+data:
+  input_type: "flows_csv"          # we are NOT using packet preprocessing
+  time_column: "StartTime"         # dataset column
+  label_column: "Target"           # 0 = normal, 1 = attack
+  class_column: "Traffic"          # optional (e.g., "normal", "DoS"); safe to ignore in code
+
+# -------------------------------
+# Features (exactly 23)
+# NOTE: These names must match your CSV header exactly.
+# -------------------------------
+
+features:
+  categorical:
+    - Sport
+    - Dport
+    - Proto
+
+  numeric:
+    - Mean
+    - SrcPkts
+    - DstPkts
+    - TotPkts
+    - SrcBytes
+    - DstBytes
+    - TotBytes
+    - SrcLoad
+    - DstLoad
+    - Load
+    - SrcRate
+    - DstRate
+    - Rate
+    - SrcLoss
+    - DstLoss
+    - Loss
+    - pLoss
+    - SrcJitter
+    - DstJitter
+    - SIntPkt
+    - DIntPkt
+
+# IMPORTANT (for Step 3 preprocessing):
+# We will feed the model a single feature vector per flow row.
+# Sport, Dport, Proto are categorical (embedded); 21 numeric features.
+# input_dim = 24 total.
+
+preprocess:
+  window_size: 10                 # choose later; 10 is a reasonable start
+  stride: 1                       # sliding window step
+  sort_time: true                 # sort by StartTime before windowing
+  dropna: true                    # drop rows with missing feature values
+  # optional: if StartTime is a string, we will parse it in code
+
+paths:
+  # For now, point to your sample file so we can test the pipeline.
+  # Later you will point this to the full giant CSV on the training machine.
+  sample_xlsx: "src/data/DATASET_Sample_1000.xlsx"
+  # full_csv: "PATH/TO/YOUR/GIANT.csv"
+
+  processed_sequences_npy: "data/processed/sequences.npy"
+  processed_seq_labels_npy: "data/processed/seq_labels.npy"
+  processed_npz: "data/processed/preprocessed.npz"
+
+dataset:
+  dtype: "float32"
+  return_targets: true
+
+model:
+  input_dim: 24
+  hidden_dim: 64
+  num_layers: 1
+  dropout: 0.0
+  bidirectional: false
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 32
+  seed: 42
+  device: "cpu"
+  checkpoint_path: "experiments/results/flair_minimal.pt"
+
+evaluation:
+  threshold_percentile: 99
+  output_csv: "experiments/results/anomaly_scores.csv"
