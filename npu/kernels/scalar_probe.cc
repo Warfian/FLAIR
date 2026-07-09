@@ -100,7 +100,42 @@ void scalar_probe_bf16(bfloat16 *x_window, bfloat16 *params, bfloat16 *out) {
   out[11] = (bfloat16)tanh_approx(gi0);     // Pade tanh on matvec output
   out[12] = (bfloat16)sigmoid_approx(gi0);  // sigmoid on matvec output
 
-  for (int i = 13; i < HIDDEN_DIM; i++)
+  // --- Full single gru_step test (reproduces the encoder's per-step stack:
+  // gi[192] + gh[192] arrays + the 64-unit scalar Pade gate loop) ---
+  const bfloat16 *w_hh = params + H3 * INPUT_DIM;
+  const bfloat16 *b_hh = b_ih + H3;
+
+  bfloat16 gi[H3];
+  bfloat16 gh[H3];
+  bfloat16 hloc[H];
+  for (int i = 0; i < H; i++)
+    hloc[i] = (bfloat16)0.0f; // h = 0
+
+  for (int row = 0; row < H3; row++) {
+    float acc = (float)b_ih[row];
+    for (int i = 0; i < INPUT_DIM; i++)
+      acc += (float)w_ih[row * INPUT_DIM + i] * (float)x_window[i];
+    gi[row] = (bfloat16)acc;
+  }
+  for (int row = 0; row < H3; row++) {
+    float acc = (float)b_hh[row];
+    for (int i = 0; i < H; i++)
+      acc += (float)w_hh[row * H + i] * (float)hloc[i];
+    gh[row] = (bfloat16)acc;
+  }
+  for (int i = 0; i < H; i++) {
+    float r = sigmoid_approx((float)gi[i] + (float)gh[i]);
+    float z = sigmoid_approx((float)gi[H + i] + (float)gh[H + i]);
+    float n = tanh_approx((float)gi[2 * H + i] + r * (float)gh[2 * H + i]);
+    float h_old = (float)hloc[i];
+    hloc[i] = (bfloat16)((1.0f - z) * n + z * h_old);
+  }
+
+  // Output the first 8 hidden values of the full step to out[13..20].
+  for (int i = 0; i < 8; i++)
+    out[13 + i] = hloc[i];
+
+  for (int i = 21; i < HIDDEN_DIM; i++)
     out[i] = (bfloat16)0.0f;
 
   event1();
