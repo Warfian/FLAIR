@@ -37,19 +37,24 @@ SEQ_LEN = 10  # preprocess.window_size in config.yaml
 
 
 def _make_encoder_kernel(arg_types, compile_flags):
-    """Build the gru_encoder ExternalFunction. The gates use a scalar fp32
-    Pade tanh (no LUT), so unlike the single-cell kernel there's no
-    lut_based_ops.cpp to compile in -- just the aie_api base headers and the
-    kernels dir (so gru_encoder.cc can #include "gru_common.h")."""
+    """Build the gru_encoder ExternalFunction. The Pade gates' reciprocal uses
+    getInvBf16 from lut_based_ops.h (the AIE core has no fp32 divide), so we
+    compile lut_based_ops.cpp into the TU (for its m_inv_lut table) via a
+    source_string wrapper, and add the aie_runtime_lib/AIE2 include dir.
+    Also add the kernels dir so gru_encoder.cc can #include "gru_common.h"."""
     header_base = Path(config.cxx_header_path())
+    runtime_dir = Path(config.root_path()) / "aie_runtime_lib" / "AIE2"
+    lut_cpp = runtime_dir / "lut_based_ops.cpp"
     include_dirs = [
         str(header_base),                  # aie_api/aie.hpp
         str(header_base / "aie_kernels"),  # aie_kernel_utils.h (if used)
+        str(runtime_dir),                  # lut_based_ops.h
         str(_KERNELS_DIR),                 # gru_common.h
     ]
+    source = f'#include "{_KERNEL_SRC}"\n#include "{lut_cpp}"\n'
     return ExternalFunction(
         "gru_encoder_bf16",
-        source_file=str(_KERNEL_SRC),
+        source_string=source,
         arg_types=arg_types,
         include_dirs=include_dirs,
         compile_flags=compile_flags,

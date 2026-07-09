@@ -21,7 +21,8 @@
 //    (arithmetic only). The hidden state is stored bf16 between timesteps.
 //
 // Include requirement: the including .cc must pull in aie_api/aie.hpp (bfloat16
-// type) and <stdint.h> (uint32_t) before this header. No lut_based_ops.h.
+// type) and lut_based_ops.h (getInvBf16) before this header, and the driver
+// must compile lut_based_ops.cpp into the TU (for m_inv_lut).
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
@@ -36,18 +37,13 @@
 namespace flair {
 
 // 1/d for d > 0 without the '/' operator (the AIE core has no fp32 divide).
-// Bit-trick initial estimate (magic constant for reciprocal) + 3 Newton steps
-// (r <- r*(2 - d*r)); reaches ~1e-7 relative accuracy. Arithmetic + a union
-// bit-reinterpret only -- no aie::inv, no divide, no LUT.
+// getInvBf16 is a bit-manipulation reciprocal from lut_based_ops.h that is
+// PROVEN to run on this core (the earlier exp-LUT sigmoid used it); it does
+// its float<->int reinterpret via a pointer cast, which Peano honors, unlike
+// the union bit-trick that produced NaN. Seed with getInvBf16 (~bf16, 0.4%),
+// then two Newton steps (r <- r*(2 - d*r)) to reach ~fp32 accuracy.
 inline float recip(float d) {
-  union {
-    float f;
-    uint32_t i;
-  } u;
-  u.f = d;
-  u.i = 0x7EF127EAu - u.i;
-  float r = u.f;
-  r = r * (2.0f - d * r);
+  float r = (float)getInvBf16(d);
   r = r * (2.0f - d * r);
   r = r * (2.0f - d * r);
   return r;

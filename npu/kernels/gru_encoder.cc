@@ -21,6 +21,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <aie_api/aie.hpp>
+#include <lut_based_ops.h> // getInvBf16 (used by gru_common.h's recip)
 #include <stdint.h>
 
 using namespace aie;
