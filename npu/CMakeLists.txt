@@ -12,16 +12,17 @@ cmake_minimum_required(VERSION 3.30)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
-# Dims from the trained checkpoint (INPUT_DIM=45, HIDDEN_DIM=64).
-# STATE_LEN is padded to even (110) for 4-byte DMA alignment; N_PARAMS is
-# 3*HIDDEN_DIM*(INPUT_DIM + HIDDEN_DIM) + 2*3*HIDDEN_DIM = 21312.
+# Dims from the trained checkpoint (INPUT_DIM=45, HIDDEN_DIM=64, SEQ_LEN=10).
+# Encoder buffers: in1 = x_window (SEQ_LEN*INPUT_DIM), in2 = params
+# (encoder GRU = 3*HIDDEN_DIM*(INPUT_DIM+HIDDEN_DIM) + 2*3*HIDDEN_DIM = 21312),
+# out = latent (HIDDEN_DIM).
 set(INPUT_DIM 45 CACHE STRING "GRU input dim")
 set(HIDDEN_DIM 64 CACHE STRING "GRU hidden dim")
-set(STATE_LEN 110 CACHE STRING "padded state length (x_in + h_prev + pad)")
-set(N_PARAMS 21312 CACHE STRING "total packed params")
+set(SEQ_LEN 10 CACHE STRING "encoder window length")
+set(N_PARAMS 21312 CACHE STRING "total packed encoder params")
 
 # Buffer sizes in bytes (bf16 = 2 bytes/elem).
-math(EXPR IN1_SIZE "${STATE_LEN} * 2")
+math(EXPR IN1_SIZE "${SEQ_LEN} * ${INPUT_DIM} * 2")
 math(EXPR IN2_SIZE "${N_PARAMS} * 2")
 math(EXPR OUT_SIZE "${HIDDEN_DIM} * 2")
 
@@ -38,7 +39,7 @@ add_executable(${currentTarget} test.cpp)
 target_compile_definitions(${currentTarget} PUBLIC
     INPUT_DIM=${INPUT_DIM}
     HIDDEN_DIM=${HIDDEN_DIM}
-    STATE_LEN=${STATE_LEN}
+    SEQ_LEN=${SEQ_LEN}
     N_PARAMS=${N_PARAMS}
     IN1_SIZE=${IN1_SIZE}
     IN2_SIZE=${IN2_SIZE}
