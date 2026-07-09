@@ -20,9 +20,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 
-#include "aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
-#include <lut_based_ops.h>
 #include <stdint.h>
 
 using namespace aie;
