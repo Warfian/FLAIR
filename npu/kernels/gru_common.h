@@ -30,6 +30,16 @@
 
 namespace flair {
 
+// Reciprocal of a positive float without the '/' operator: the AIE core has
+// no hardware fp32 divide (a literal `a / b` yields NaN), so we use the AIE
+// reciprocal primitive plus one Newton-Raphson step (mul/sub only) to reach
+// ~fp32 accuracy regardless of aie::inv's base precision. Same reason
+// aie_kernels/aie2/softmax.cc uses aie::inv instead of '/'.
+inline float recip(float d) {
+  float r = ::aie::inv(d);
+  return r * (2.0f - d * r); // one Newton step: r*(2 - d*r)
+}
+
 // Rational Pade[7/6] approximation of tanh, fp32. Accurate to ~6e-4 for
 // |x| <= 4; clamp beyond (tanh saturates: tanh(4) ~ 0.9993). Arithmetic only.
 inline float tanh_approx(float x) {
@@ -40,7 +50,7 @@ inline float tanh_approx(float x) {
   float x2 = x * x;
   float num = x * (135135.0f + x2 * (17325.0f + x2 * (378.0f + x2)));
   float den = 135135.0f + x2 * (62370.0f + x2 * (3150.0f + 28.0f * x2));
-  return num / den;
+  return num * recip(den);
 }
 
 inline float sigmoid_approx(float x) {
