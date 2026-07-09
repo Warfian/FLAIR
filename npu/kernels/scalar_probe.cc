@@ -56,23 +56,26 @@ extern "C" {
 
 void scalar_probe_bf16(bfloat16 *x_window, bfloat16 *params, bfloat16 *out) {
   event0();
-  (void)x_window;
   (void)params;
 
-  float x = 1.0f;
+  // RUNTIME input (from the DMA'd buffer) so the compiler cannot constant-fold
+  // the ladder -- this exercises the actual runtime scalar-fp32 path the
+  // encoder uses. x_window[0] is real data; read out[0] to see its value and
+  // verify out[7]==tanh(out[0]), out[8]==sigmoid(out[0]). Finite outputs =>
+  // runtime scalar fp32 works; NaN => it's broken (the encoder's real cause).
+  float x = (float)x_window[0];
   float x2 = x * x;
-  float d = 152460.0f;
-  float r0 = (float)getInvBf16(d);
+  float d = 135135.0f + x2 * 62370.0f; // runtime, ~197505 for x=1
 
-  out[0] = (bfloat16)x;                                  // sanity
-  out[1] = (bfloat16)(x * x);                            // scalar mul
-  out[2] = (bfloat16)(x + x);                            // scalar add
-  out[3] = (bfloat16)135135.0f;                          // large constant
-  out[4] = (bfloat16)(135135.0f + x2 * 17325.0f);        // large-const arith
-  out[5] = (bfloat16)r0;                                 // getInvBf16(large)
-  out[6] = (bfloat16)recip(d);                           // recip + Newton
-  out[7] = (bfloat16)tanh_approx(x);                     // full Pade tanh
-  out[8] = (bfloat16)sigmoid_approx(x);                  // full sigmoid
+  out[0] = (bfloat16)x;                           // runtime sanity
+  out[1] = (bfloat16)(x * x);                     // runtime scalar mul
+  out[2] = (bfloat16)(x + x);                     // runtime scalar add
+  out[3] = (bfloat16)(135135.0f * x);             // runtime large value
+  out[4] = (bfloat16)(135135.0f + x2 * 17325.0f); // runtime large-const arith
+  out[5] = (bfloat16)((float)getInvBf16(d));      // runtime getInvBf16(large)
+  out[6] = (bfloat16)recip(d);                    // runtime recip + Newton
+  out[7] = (bfloat16)tanh_approx(x);              // runtime full Pade tanh
+  out[8] = (bfloat16)sigmoid_approx(x);           // runtime full sigmoid
 
   for (int i = 9; i < HIDDEN_DIM; i++)
     out[i] = (bfloat16)0.0f;
