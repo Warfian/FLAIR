@@ -135,7 +135,27 @@ void scalar_probe_bf16(bfloat16 *x_window, bfloat16 *params, bfloat16 *out) {
   for (int i = 0; i < 8; i++)
     out[13 + i] = hloc[i];
 
-  for (int i = 21; i < HIDDEN_DIM; i++)
+  // --- Unit-6 breakdown (the NaN unit): dump every intermediate so we see
+  // exactly which gate input / nonlinearity produces the NaN. ---
+  {
+    int u = 6;
+    float pre_r = (float)gi[u] + (float)gh[u];
+    float r6 = sigmoid_approx(pre_r);
+    float pre_z = (float)gi[H + u] + (float)gh[H + u];
+    float z6 = sigmoid_approx(pre_z);
+    float n_pre = (float)gi[2 * H + u] + r6 * (float)gh[2 * H + u];
+    float n6 = tanh_approx(n_pre);
+    out[21] = (bfloat16)pre_r;  // reset-gate input
+    out[22] = (bfloat16)r6;     // sigmoid(pre_r)
+    out[23] = (bfloat16)pre_z;  // update-gate input
+    out[24] = (bfloat16)z6;     // sigmoid(pre_z)
+    out[25] = (bfloat16)n_pre;  // candidate input
+    out[26] = (bfloat16)n6;     // tanh(n_pre)
+    out[27] = (bfloat16)((float)gi[2 * H + u]); // raw gi_n[6]
+    out[28] = (bfloat16)((float)gh[2 * H + u]); // raw gh_n[6]
+  }
+
+  for (int i = 29; i < HIDDEN_DIM; i++)
     out[i] = (bfloat16)0.0f;
 
   event1();
