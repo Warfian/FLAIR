@@ -63,18 +63,42 @@ tanh16(const aie::vector<bfloat16, 16> &x) {
   return aie::sub(two_s, one);
 }
 
-// out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]
-// Scalar, float32 accumulation, bf16 storage. Correctness-first (not yet
-// vectorized). `bias` may be nullptr for a plain matvec (no bias add).
+// out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]. bf16 in/out, fp32
+// accumulation. `bias` may be nullptr.
+//
+// Two paths:
+//  * cols a multiple of 16  -> VECTORIZED per-row dot product (16-lane bf16
+//    MAC into an accfloat accumulator + reduce_add). This path requires the
+//    weight rows AND `in` to be 32-byte (aie::vector_decl_align) aligned:
+//    a row starts at w + row*cols, so cols%16==0 keeps every row aligned iff
+//    `w` and `in` are aligned. Callers must guarantee that (the encoder's
+//    w_hh @ h qualifies: w_hh rows are 128-byte-strided and h is aligned).
+//  * otherwise -> scalar fallback (handles e.g. the encoder's w_ih, cols=45,
+//    until the weights are padded to a multiple of 16).
 inline void matvec_bias(const bfloat16 *restrict w, const bfloat16 *restrict in,
                         const bfloat16 *restrict bias, bfloat16 *restrict out,
                         int rows, int cols) {
-  for (int row = 0; row < rows; row++) {
-    float acc = bias ? (float)bias[row] : 0.0f;
-    const bfloat16 *restrict w_row = w + row * cols;
-    for (int i = 0; i < cols; i++)
-      acc += (float)w_row[i] * (float)in[i];
-    out[row] = (bfloat16)acc;
+  if ((cols & 15) == 0) {
+    for (int row = 0; row < rows; row++) {
+      const bfloat16 *restrict w_row = w + row * cols;
+      aie::accum<accfloat, 16> acc = aie::mul(aie::load_v<16>(w_row),
+                                              aie::load_v<16>(in));
+      for (int i = 16; i < cols; i += 16) {
+        aie::vector<bfloat16, 16> wv = aie::load_v<16>(w_row + i);
+        aie::vector<bfloat16, 16> iv = aie::load_v<16>(in + i);
+        acc = aie::mac(acc, wv, iv);
+      }
+      float dot = aie::reduce_add(acc.to_vector<float>());
+      out[row] = (bfloat16)(dot + (bias ? (float)bias[row] : 0.0f));
+    }
+  } else {
+    for (int row = 0; row < rows; row++) {
+      float acc = bias ? (float)bias[row] : 0.0f;
+      const bfloat16 *restrict w_row = w + row * cols;
+      for (int i = 0; i < cols; i++)
+        acc += (float)w_row[i] * (float)in[i];
+      out[row] = (bfloat16)acc;
+    }
   }
 }
 
