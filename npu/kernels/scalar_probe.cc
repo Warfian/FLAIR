@@ -27,6 +27,9 @@ using namespace aie;
 #ifndef HIDDEN_DIM
 #define HIDDEN_DIM 64
 #endif
+#ifndef INPUT_DIM
+#define INPUT_DIM 45
+#endif
 
 // scalar fp32 reciprocal: getInvBf16 seed + 2 Newton steps (mul/sub only).
 static inline float recip(float d) {
@@ -76,8 +79,28 @@ void scalar_probe_bf16(bfloat16 *x_window, bfloat16 *params, bfloat16 *out) {
   out[6] = (bfloat16)recip(d);                    // runtime recip + Newton
   out[7] = (bfloat16)tanh_approx(x);              // runtime full Pade tanh
   out[8] = (bfloat16)sigmoid_approx(x);           // runtime full sigmoid
+  out[9] = (bfloat16)0.0f;                         // (gap marker)
 
-  for (int i = 9; i < HIDDEN_DIM; i++)
+  // --- Integration test: matvec output feeding a scalar gate ---
+  // Layout of params (real encoder weights): w_ih | w_hh | b_ih | b_hh.
+  // Compute gi[0] = w_ih[0,:] . x_window[0:INPUT_DIM] + b_ih[0] (the first
+  // matvec output row), then feed it through the scalar sigmoid. This is
+  // exactly what gru_step does; if out[10..12] are finite, matvec->gate
+  // integration works and the encoder NaN is in the recurrence/loop.
+  constexpr int H = HIDDEN_DIM;
+  constexpr int H3 = 3 * H;
+  const bfloat16 *w_ih = params;
+  const bfloat16 *b_ih = params + H3 * INPUT_DIM + H3 * H;
+
+  float gi0 = (float)b_ih[0];
+  for (int i = 0; i < INPUT_DIM; i++)
+    gi0 += (float)w_ih[i] * (float)x_window[i]; // matvec row 0
+
+  out[10] = (bfloat16)gi0;                  // matvec output (runtime)
+  out[11] = (bfloat16)tanh_approx(gi0);     // Pade tanh on matvec output
+  out[12] = (bfloat16)sigmoid_approx(gi0);  // sigmoid on matvec output
+
+  for (int i = 13; i < HIDDEN_DIM; i++)
     out[i] = (bfloat16)0.0f;
 
   event1();
