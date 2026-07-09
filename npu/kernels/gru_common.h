@@ -1,22 +1,27 @@
 //===- gru_common.h ---------------------------------------*- C++ -*-===//
 //
 // Shared AIE kernel building blocks for the FLAIR GRU designs (encoder,
-// decoder, full forward). Scalar, fp32-accurate, correctness-first
-// (vectorization of the matvec is a later phase).
+// decoder, full forward). Scalar, correctness-first (vectorizing the matvec
+// is a later phase).
 //
 // Nonlinearities use a rational Pade approximation of tanh in fp32 (arithmetic
 // only -- no LUT). The earlier exp-LUT path (getExpBf16) is only ~12.8%
 // accurate and systematically biased, which compounded through the recurrence
 // (encoder latent diverged up to ~0.35 over 10 steps). The Pade tanh is
-// ~6e-4 accurate and unbiased; validated in numpy to hold the 10-step encode
-// to <0.005 vs the float golden. sigmoid(x) = 0.5*(1 + tanh(x/2)).
+// ~6e-4 accurate and unbiased; numpy-validated to hold the 10-step encode to
+// <0.005 vs the float golden. sigmoid(x) = 0.5*(1 + tanh(x/2)).
 //
-// The gates + combine run in fp32; the hidden state is stored bf16 between
-// timesteps (numpy-confirmed sufficient once the gates are accurate). The
-// matvecs accumulate in fp32 and emit fp32 gate pre-activations.
+// Two AIE hardware constraints shaped this file:
+//  * The core stack is tiny (~1024 B), so gate pre-activations gi/gh are
+//    stored as bf16 (384 B each), NOT fp32 (768 B each -> stack overflow ->
+//    all-NaN output). Numpy confirms bf16 gi/gh is sufficient once the gates
+//    are accurate.
+//  * The core has no hardware fp32 divide (a literal `a / b` yields NaN), so
+//    reciprocal uses a bit-trick initial estimate + Newton refinement
+//    (arithmetic only). The hidden state is stored bf16 between timesteps.
 //
-// Include requirement: the including .cc must pull in aie_api/aie.hpp (for the
-// bfloat16 type) before this header. No lut_based_ops.h dependency.
+// Include requirement: the including .cc must pull in aie_api/aie.hpp (bfloat16
+// type) and <stdint.h> (uint32_t) before this header. No lut_based_ops.h.
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
@@ -30,14 +35,22 @@
 
 namespace flair {
 
-// Reciprocal of a positive float without the '/' operator: the AIE core has
-// no hardware fp32 divide (a literal `a / b` yields NaN), so we use the AIE
-// reciprocal primitive plus one Newton-Raphson step (mul/sub only) to reach
-// ~fp32 accuracy regardless of aie::inv's base precision. Same reason
-// aie_kernels/aie2/softmax.cc uses aie::inv instead of '/'.
+// 1/d for d > 0 without the '/' operator (the AIE core has no fp32 divide).
+// Bit-trick initial estimate (magic constant for reciprocal) + 3 Newton steps
+// (r <- r*(2 - d*r)); reaches ~1e-7 relative accuracy. Arithmetic + a union
+// bit-reinterpret only -- no aie::inv, no divide, no LUT.
 inline float recip(float d) {
-  float r = ::aie::inv(d);
-  return r * (2.0f - d * r); // one Newton step: r*(2 - d*r)
+  union {
+    float f;
+    uint32_t i;
+  } u;
+  u.f = d;
+  u.i = 0x7EF127EAu - u.i;
+  float r = u.f;
+  r = r * (2.0f - d * r);
+  r = r * (2.0f - d * r);
+  r = r * (2.0f - d * r);
+  return r;
 }
 
 // Rational Pade[7/6] approximation of tanh, fp32. Accurate to ~6e-4 for
@@ -57,26 +70,25 @@ inline float sigmoid_approx(float x) {
   return 0.5f * (1.0f + tanh_approx(0.5f * x));
 }
 
-// out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row], fp32 accumulation,
-// fp32 output. Scalar (not yet vectorized). `bias` may be nullptr.
-inline void matvec_bias_f32out(const bfloat16 *restrict w,
-                               const bfloat16 *restrict in,
-                               const bfloat16 *restrict bias,
-                               float *restrict out, int rows, int cols) {
+// out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]. fp32 accumulation,
+// bf16 output (fits the tiny core stack). Scalar. `bias` may be nullptr.
+inline void matvec_bias(const bfloat16 *restrict w, const bfloat16 *restrict in,
+                        const bfloat16 *restrict bias, bfloat16 *restrict out,
+                        int rows, int cols) {
   for (int row = 0; row < rows; row++) {
     float acc = bias ? (float)bias[row] : 0.0f;
     const bfloat16 *restrict w_row = w + row * cols;
     for (int i = 0; i < cols; i++)
       acc += (float)w_row[i] * (float)in[i];
-    out[row] = acc;
+    out[row] = (bfloat16)acc;
   }
 }
 
 // One GRU timestep, updating the bf16 hidden state h in place (PyTorch
 // nn.GRUCell math):
-//   gi = w_ih @ x_in + b_ih ; gh = w_hh @ h + b_hh   (fp32)
+//   gi = w_ih @ x_in + b_ih ; gh = w_hh @ h + b_hh    (bf16 pre-activations)
 //   r = sigmoid(gi_r+gh_r) ; z = sigmoid(gi_z+gh_z)
-//   n = tanh(gi_n + r*gh_n) ; h <- (1-z)*n + z*h      (fp32 gates + combine)
+//   n = tanh(gi_n + r*gh_n) ; h <- (1-z)*n + z*h       (fp32 gates + combine)
 // Gate order [reset, update, new] (PyTorch weight_ih/hh layout).
 // `input_dim` is the length of x_in (encoder: 45, decoder: HIDDEN_DIM).
 // No alignment requirement on h (all scalar access).
@@ -88,15 +100,15 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
-  float gi[H3];
-  float gh[H3];
-  matvec_bias_f32out(w_ih, x_in, b_ih, gi, H3, input_dim);
-  matvec_bias_f32out(w_hh, h, b_hh, gh, H3, H); // uses old h
+  bfloat16 gi[H3]; // bf16 to fit the ~1024 B core stack (fp32 would overflow)
+  bfloat16 gh[H3];
+  matvec_bias(w_ih, x_in, b_ih, gi, H3, input_dim);
+  matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses old h
 
   for (int i = 0; i < H; i++) {
-    float r = sigmoid_approx(gi[i] + gh[i]);
-    float z = sigmoid_approx(gi[H + i] + gh[H + i]);
-    float n = tanh_approx(gi[2 * H + i] + r * gh[2 * H + i]);
+    float r = sigmoid_approx((float)gi[i] + (float)gh[i]);
+    float z = sigmoid_approx((float)gi[H + i] + (float)gh[H + i]);
+    float n = tanh_approx((float)gi[2 * H + i] + r * (float)gh[2 * H + i]);
     float h_old = (float)h[i];
     h[i] = (bfloat16)((1.0f - z) * n + z * h_old);
   }
