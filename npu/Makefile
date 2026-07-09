@@ -60,7 +60,7 @@ $(eval $(call build_host_exe,${targetname},_build,test.cpp,${XRT_FLAGS} -DINPUT_
 .PHONY: data
 data: gru_golden.bin
 gru_state.bin gru_params.bin gru_golden.bin &: gen_encoder_data.py
-	python3 ${srcdir}/gen_encoder_data.py
+	python3 ${srcdir}/gen_encoder_data.py --seq-len ${SEQ_LEN}
 
 .PHONY: run
 run: ${targetname}.exe ${xclbin_target} ${insts_target} data

@@ -17,6 +17,7 @@ Usage (from npu/):  python gen_encoder_data.py
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +25,7 @@ from ml_dtypes import bfloat16
 
 INPUT_DIM = 45
 HIDDEN_DIM = 64
-SEQ_LEN = 10
+SEQ_LEN = 10  # default; override with --seq-len (must match the kernel's SEQ_LEN)
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
@@ -49,6 +50,11 @@ def gru_step_golden(x, h, w_ih, w_hh, b_ih, b_hh):
 def main() -> None:
     import torch
 
+    p = argparse.ArgumentParser()
+    p.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    args = p.parse_args()
+    seq_len = args.seq_len
+
     ckpt = torch.load(str(_CKPT), map_location="cpu")
     sd = ckpt["model_state_dict"]
 
@@ -69,7 +75,7 @@ def main() -> None:
     proto_w = sd["proto_emb.weight"].numpy()
 
     x_in_steps = []
-    for t in range(SEQ_LEN):
+    for t in range(seq_len):
         xin = np.concatenate([
             x_num[t],
             sport_w[x_cat[t, 0]],
@@ -77,7 +83,7 @@ def main() -> None:
             proto_w[x_cat[t, 2]],
         ]).astype(bfloat16)
         x_in_steps.append(xin)
-    x_window = np.concatenate(x_in_steps).astype(bfloat16)  # (T*INPUT_DIM,)
+    x_window = np.concatenate(x_in_steps).astype(bfloat16)  # (seq_len*INPUT_DIM,)
 
     # Golden latent: run the encode in float from the bf16-quantized inputs.
     w_ih = w_ih_bf.astype(np.float32)
@@ -85,7 +91,7 @@ def main() -> None:
     b_ih = b_ih_bf.astype(np.float32)
     b_hh = b_hh_bf.astype(np.float32)
     h = np.zeros(HIDDEN_DIM, dtype=np.float32)
-    for t in range(SEQ_LEN):
+    for t in range(seq_len):
         h = gru_step_golden(x_in_steps[t].astype(np.float32), h, w_ih, w_hh, b_ih, b_hh)
     latent = h.astype(np.float32)
 
