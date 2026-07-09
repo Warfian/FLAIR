@@ -105,8 +105,11 @@ void scalar_probe_bf16(bfloat16 *x_window, bfloat16 *params, bfloat16 *out) {
   const bfloat16 *w_hh = params + H3 * INPUT_DIM;
   const bfloat16 *b_hh = b_ih + H3;
 
-  bfloat16 gi[H3];
-  bfloat16 gh[H3];
+  // static -> L1 data (BSS), NOT the ~1 KB stack. The 768 B of gi/gh on the
+  // stack + the scalar loop temporaries overflow it (the NaN moves with code
+  // layout -> memory corruption, not a data-dependent NaN).
+  static bfloat16 gi[H3];
+  static bfloat16 gh[H3];
   bfloat16 hloc[H];
   for (int i = 0; i < H; i++)
     hloc[i] = (bfloat16)0.0f; // h = 0
