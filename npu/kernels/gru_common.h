@@ -1,29 +1,23 @@
 //===- gru_common.h ---------------------------------------*- C++ -*-===//
 //
 // Shared AIE kernel building blocks for the FLAIR GRU designs (encoder,
-// decoder, full forward). Scalar, correctness-first (vectorizing the matvec
-// is a later phase).
+// decoder, full forward). Factored out of the validated single-cell kernel
+// (gru_cell.cc) so the multi-timestep designs reuse the exact same,
+// hardware-verified math.
 //
-// Nonlinearities use a rational Pade approximation of tanh in fp32 (arithmetic
-// only, ~6e-4 accurate and unbiased -- numpy-validated to hold the 10-step
-// encode to <0.005 vs the float golden). The exp-LUT path (getExpBf16) was
-// only ~12.8% accurate and its bias compounded through the recurrence.
-// sigmoid(x) = 0.5*(1 + tanh(x/2)).
+// Include requirements (provided by the IRON driver's include_dirs + the
+// source_string wrapper that compiles lut_based_ops.cpp into the TU):
+//   aie_kernel_utils.h, aie_api/aie.hpp, lut_based_ops.h
+// The including .cc must pull those in before this header.
 //
-// AIE hardware constraints that shaped this file:
-//  * The core stack is tiny (~1 KB). The gate pre-activations gi/gh are 192
-//    bf16 each (768 B together); on the stack, they + the scalar gate loop's
-//    temporaries overflow it and corrupt memory (manifests as a NaN whose
-//    index MOVES with code layout). They are declared `static` so they live
-//    in L1 data (BSS), NOT the stack. Safe because they are pure scratch,
-//    fully written before read on every gru_step call.
-//  * The core has no fp32 divide (`a / b` yields NaN); reciprocal uses
-//    getInvBf16 (a proven bit-manipulation reciprocal from lut_based_ops.h)
-//    refined by Newton steps.
-//
-// Include requirement: the including .cc must pull in aie_api/aie.hpp (bfloat16
-// type) and lut_based_ops.h (getInvBf16) before this header, and the driver
-// must compile lut_based_ops.cpp into the TU (for m_inv_lut).
+// Key learned constraints (see the FLAIR NPU memory / commit history):
+//  * aie::mul/add/sub of two bf16 vectors return an aie::accum, not a vector;
+//    materialize each into an explicit vector before feeding the next op.
+//  * Nonlinearities are built from the EXP LUT (getExpBf16, truncate policy,
+//    never NaN), NOT getTanhBf16 (which had a deterministic NaN on an
+//    interior input).
+//  * aie::load_v<16>/store_v need 32-byte-aligned pointers; copy any buffer
+//    reached at a non-vector-aligned offset into an aligned local first.
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
@@ -35,37 +29,43 @@
 #define HIDDEN_DIM 64
 #endif
 
+static_assert(HIDDEN_DIM % 16 == 0,
+             "HIDDEN_DIM must be a multiple of 16 (16-lane bf16 vector ops)");
+
 namespace flair {
 
-// 1/d for d > 0 without the '/' operator (the AIE core has no fp32 divide).
-// getInvBf16 (pointer-cast bit-manipulation reciprocal, proven to run on this
-// core) as the seed, refined by two Newton steps (r <- r*(2 - d*r)).
-inline float recip(float d) {
-  float r = (float)getInvBf16(d);
-  r = r * (2.0f - d * r);
-  r = r * (2.0f - d * r);
-  return r;
+// sigmoid(x) = 1 / (1 + exp(-x)). exp via getExpBf16 (vector, robust);
+// reciprocal per-lane via getInvBf16 (scalar bit-manipulation, no LUT range).
+inline aie::vector<bfloat16, 16>
+sigmoid16(const aie::vector<bfloat16, 16> &x) {
+  aie::vector<bfloat16, 16> zero = aie::broadcast<bfloat16, 16>(0.0f);
+  aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  aie::vector<bfloat16, 16> neg_x = aie::sub(zero, x);              // -x
+  aie::vector<bfloat16, 16> e = to_v16bfloat16(getExpBf16(neg_x));  // exp(-x)
+  aie::vector<bfloat16, 16> denom = aie::add(one, e);              // 1 + exp(-x)
+
+  alignas(aie::vector_decl_align) bfloat16 denom_arr[16];
+  alignas(aie::vector_decl_align) bfloat16 out_arr[16];
+  aie::store_v(denom_arr, denom);
+  for (int j = 0; j < 16; j++)
+    out_arr[j] = getInvBf16((float)denom_arr[j]);                  // 1 / denom
+  return aie::load_v<16>(out_arr);
 }
 
-// Rational Pade[7/6] approximation of tanh, fp32. ~6e-4 for |x| <= 4; clamp
-// beyond (tanh saturates: tanh(4) ~ 0.9993). Arithmetic + recip only.
-inline float tanh_approx(float x) {
-  if (x > 4.0f)
-    x = 4.0f;
-  else if (x < -4.0f)
-    x = -4.0f;
-  float x2 = x * x;
-  float num = x * (135135.0f + x2 * (17325.0f + x2 * (378.0f + x2)));
-  float den = 135135.0f + x2 * (62370.0f + x2 * (3150.0f + 28.0f * x2));
-  return num * recip(den);
+// tanh(x) = 2*sigmoid(2x) - 1.
+inline aie::vector<bfloat16, 16>
+tanh16(const aie::vector<bfloat16, 16> &x) {
+  aie::vector<bfloat16, 16> two = aie::broadcast<bfloat16, 16>(2.0f);
+  aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  aie::vector<bfloat16, 16> two_x = aie::mul(x, two);
+  aie::vector<bfloat16, 16> s = sigmoid16(two_x);
+  aie::vector<bfloat16, 16> two_s = aie::mul(two, s);
+  return aie::sub(two_s, one);
 }
 
-inline float sigmoid_approx(float x) {
-  return 0.5f * (1.0f + tanh_approx(0.5f * x));
-}
-
-// out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]. fp32 accumulation,
-// bf16 output. Scalar. `bias` may be nullptr.
+// out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]
+// Scalar, float32 accumulation, bf16 storage. Correctness-first (not yet
+// vectorized). `bias` may be nullptr for a plain matvec (no bias add).
 inline void matvec_bias(const bfloat16 *restrict w, const bfloat16 *restrict in,
                         const bfloat16 *restrict bias, bfloat16 *restrict out,
                         int rows, int cols) {
@@ -78,12 +78,15 @@ inline void matvec_bias(const bfloat16 *restrict w, const bfloat16 *restrict in,
   }
 }
 
-// One GRU timestep, updating the bf16 hidden state h in place (PyTorch
-// nn.GRUCell math):
-//   gi = w_ih @ x_in + b_ih ; gh = w_hh @ h + b_hh    (bf16 pre-activations)
+// One GRU timestep, updating h in place (PyTorch nn.GRUCell math):
+//   gi = w_ih @ x_in + b_ih ; gh = w_hh @ h + b_hh
 //   r = sigmoid(gi_r+gh_r) ; z = sigmoid(gi_z+gh_z)
-//   n = tanh(gi_n + r*gh_n) ; h <- (1-z)*n + z*h       (fp32 gates + combine)
+//   n = tanh(gi_n + r*gh_n) ; h <- (1-z)*n + z*h
 // Gate order [reset, update, new] (PyTorch weight_ih/hh layout).
+//
+// `h` MUST be 32-byte (aie::vector_decl_align) aligned and HIDDEN_DIM long;
+// the combine loop vector-loads/stores it. `x_in` is read scalar-only, so it
+// may sit at any offset (e.g. a per-timestep slice of a window buffer).
 // `input_dim` is the length of x_in (encoder: 45, decoder: HIDDEN_DIM).
 inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
                      const bfloat16 *restrict w_ih,
@@ -93,21 +96,46 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
-  // static -> L1 data (BSS), off the ~1 KB core stack (see file header).
-  // Pure scratch: fully written by the matvecs before the gate loop reads it,
-  // so sharing one instance across gru_step calls is safe.
-  static bfloat16 gi[H3];
-  static bfloat16 gh[H3];
+  alignas(aie::vector_decl_align) bfloat16 gi[H3];
+  alignas(aie::vector_decl_align) bfloat16 gh[H3];
+  alignas(aie::vector_decl_align) bfloat16 h_prev[H];
 
   matvec_bias(w_ih, x_in, b_ih, gi, H3, input_dim);
   matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses old h
+  // Save old h (aligned) for the z*h_prev term; after this, h may be
+  // overwritten with the new hidden state.
+  for (int i = 0; i < H; i++)
+    h_prev[i] = h[i];
 
-  for (int i = 0; i < H; i++) {
-    float r = sigmoid_approx((float)gi[i] + (float)gh[i]);
-    float z = sigmoid_approx((float)gi[H + i] + (float)gh[H + i]);
-    float n = tanh_approx((float)gi[2 * H + i] + r * (float)gh[2 * H + i]);
-    float h_old = (float)h[i];
-    h[i] = (bfloat16)((1.0f - z) * n + z * h_old);
+  const bfloat16 *gi_r = gi, *gi_z = gi + H, *gi_n = gi + 2 * H;
+  const bfloat16 *gh_r = gh, *gh_z = gh + H, *gh_n = gh + 2 * H;
+
+  AIE_LOOP_MIN_ITERATION_COUNT(H / 16)
+  for (int i = 0; i < H; i += 16) {
+    aie::vector<bfloat16, 16> vgi_r = aie::load_v<16>(gi_r + i);
+    aie::vector<bfloat16, 16> vgh_r = aie::load_v<16>(gh_r + i);
+    aie::vector<bfloat16, 16> pre_r = aie::add(vgi_r, vgh_r);
+    aie::vector<bfloat16, 16> r = sigmoid16(pre_r);
+
+    aie::vector<bfloat16, 16> vgi_z = aie::load_v<16>(gi_z + i);
+    aie::vector<bfloat16, 16> vgh_z = aie::load_v<16>(gh_z + i);
+    aie::vector<bfloat16, 16> pre_z = aie::add(vgi_z, vgh_z);
+    aie::vector<bfloat16, 16> z = sigmoid16(pre_z);
+
+    aie::vector<bfloat16, 16> vgi_n = aie::load_v<16>(gi_n + i);
+    aie::vector<bfloat16, 16> vgh_n = aie::load_v<16>(gh_n + i);
+    aie::vector<bfloat16, 16> r_gh_n = aie::mul(r, vgh_n);
+    aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
+    aie::vector<bfloat16, 16> n = tanh16(n_pre);
+
+    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
+    aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+    aie::vector<bfloat16, 16> one_minus_z = aie::sub(one, z);
+    aie::vector<bfloat16, 16> term1 = aie::mul(one_minus_z, n);
+    aie::vector<bfloat16, 16> term2 = aie::mul(z, vh_prev);
+    aie::vector<bfloat16, 16> h_out = aie::add(term1, term2);
+
+    aie::store_v(h + i, h_out); // overwrite h with the new hidden state
   }
 }
 
