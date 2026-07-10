@@ -26,6 +26,7 @@ devicename = npu
 INPUT_DIM ?= 48
 HIDDEN_DIM ?= 64
 SEQ_LEN ?= 10
+N_PARAMS ?= 21888  # 3*H*(INPUT_DIM+H)+2*3*H with INPUT_DIM=48 (padded)
 
 # Optional XRT paths for the Windows host build. On native Windows, set these
 # to your XRT clone (per buildHostWin.md), e.g.:
@@ -54,7 +55,7 @@ $(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${
 ${xclbin_target} ${insts_target}: ${srcdir}/kernels/gru_encoder.cc ${srcdir}/kernels/gru_common.h
 
 # (ii) Build the host test.exe (Windows, via cmake/powershell).
-$(eval $(call build_host_exe,${targetname},_build,test.cpp,${XRT_FLAGS} -DINPUT_DIM=${INPUT_DIM} -DHIDDEN_DIM=${HIDDEN_DIM} -DSEQ_LEN=${SEQ_LEN}))
+$(eval $(call build_host_exe,${targetname},_build,test.cpp,${XRT_FLAGS} -DNPU_MODE=encoder -DINPUT_DIM=${INPUT_DIM} -DHIDDEN_DIM=${HIDDEN_DIM} -DSEQ_LEN=${SEQ_LEN} -DN_PARAMS=${N_PARAMS}))
 
 # Golden + input binaries for the host harness (needs torch; run in WSL).
 .PHONY: data
