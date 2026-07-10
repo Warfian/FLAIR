@@ -31,7 +31,10 @@ _KERNELS_DIR = Path(__file__).parent / "kernels"
 _KERNEL_SRC = _KERNELS_DIR / "gru_encoder.cc"
 
 # Dims from the trained checkpoint (encoder.gru.weight_ih_l0: (192, 45)).
-INPUT_DIM = 45
+# INPUT_DIM is the PADDED input length: 45 real features rounded up to a
+# multiple of 16 (48) so the w_ih matvec vectorizes. gen_encoder_data.py
+# zero-pads the weights + inputs to match; the padded lanes contribute 0.
+INPUT_DIM = 48
 HIDDEN_DIM = 64
 SEQ_LEN = 10  # preprocess.window_size in config.yaml
 

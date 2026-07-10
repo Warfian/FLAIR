@@ -16,12 +16,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 # Encoder buffers: in1 = x_window (SEQ_LEN*INPUT_DIM), in2 = params
 # (encoder GRU = 3*HIDDEN_DIM*(INPUT_DIM+HIDDEN_DIM) + 2*3*HIDDEN_DIM = 21312),
 # out = latent (HIDDEN_DIM).
-set(INPUT_DIM 45 CACHE STRING "GRU input dim")
+set(INPUT_DIM 48 CACHE STRING "GRU padded input dim (45 real + 3 zero pad)")
 set(HIDDEN_DIM 64 CACHE STRING "GRU hidden dim")
 set(SEQ_LEN 10 CACHE STRING "encoder window length")
-set(N_PARAMS 21312 CACHE STRING "total packed encoder params")
 
-# Buffer sizes in bytes (bf16 = 2 bytes/elem).
+# Buffer sizes in bytes (bf16 = 2 bytes/elem). N_PARAMS is computed from the
+# (padded) dims so it tracks INPUT_DIM: w_ih + w_hh + b_ih + b_hh =
+# 3*H*(INPUT_DIM + H) + 2*3*H.
+math(EXPR N_PARAMS "3 * ${HIDDEN_DIM} * (${INPUT_DIM} + ${HIDDEN_DIM}) + 2 * 3 * ${HIDDEN_DIM}")
 math(EXPR IN1_SIZE "${SEQ_LEN} * ${INPUT_DIM} * 2")
 math(EXPR IN2_SIZE "${N_PARAMS} * 2")
 math(EXPR OUT_SIZE "${HIDDEN_DIM} * 2")

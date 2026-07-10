@@ -27,8 +27,11 @@
 
 using namespace aie;
 
+// INPUT_DIM is the PADDED input length (real 45 features + 3 zero pad = 48),
+// a multiple of 16 so the w_ih matvec vectorizes. The padded weights/inputs
+// are zero, so the result is unchanged. The driver passes -DINPUT_DIM=48.
 #ifndef INPUT_DIM
-#define INPUT_DIM 45
+#define INPUT_DIM 48
 #endif
 #ifndef HIDDEN_DIM
 #define HIDDEN_DIM 64

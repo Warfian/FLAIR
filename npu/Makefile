@@ -23,7 +23,7 @@ aie_py_src = gru_encoder.py
 # This is a Ryzen 7940HS (Phoenix / XDNA1 / AIE2) -> device "npu".
 devicename = npu
 
-INPUT_DIM ?= 45
+INPUT_DIM ?= 48
 HIDDEN_DIM ?= 64
 SEQ_LEN ?= 10
 

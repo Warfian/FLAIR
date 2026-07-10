@@ -23,7 +23,8 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
-INPUT_DIM = 45
+INPUT_DIM = 45          # real feature count (21 numeric + 3x8 embeddings)
+INPUT_DIM_PADDED = 48   # padded to a multiple of 16 so the w_ih matvec vectorizes
 HIDDEN_DIM = 64
 SEQ_LEN = 10  # default; override with --seq-len (must match the kernel's SEQ_LEN)
 
@@ -62,8 +63,14 @@ def main() -> None:
     w_hh_bf = sd["encoder.gru.weight_hh_l0"].numpy().astype(bfloat16)
     b_ih_bf = sd["encoder.gru.bias_ih_l0"].numpy().astype(bfloat16)
     b_hh_bf = sd["encoder.gru.bias_hh_l0"].numpy().astype(bfloat16)
+    # Pad w_ih rows from INPUT_DIM (45) to INPUT_DIM_PADDED (48) with zeros so
+    # each row is 32-byte aligned and cols is a multiple of 16 -> the w_ih
+    # matvec takes the vector path. The 3 padded weights are 0, so gi is
+    # unchanged. w_hh (64 cols) is already a multiple of 16.
+    w_ih_pad = np.zeros((3 * HIDDEN_DIM, INPUT_DIM_PADDED), dtype=bfloat16)
+    w_ih_pad[:, :INPUT_DIM] = w_ih_bf
     params = np.concatenate(
-        [w_ih_bf.reshape(-1), w_hh_bf.reshape(-1), b_ih_bf, b_hh_bf]
+        [w_ih_pad.reshape(-1), w_hh_bf.reshape(-1), b_ih_bf, b_hh_bf]
     ).astype(bfloat16)
 
     # First window's 10 timesteps: x_in[t] = [x_num | sport_e | dport_e | proto_e].
@@ -83,7 +90,12 @@ def main() -> None:
             proto_w[x_cat[t, 2]],
         ]).astype(bfloat16)
         x_in_steps.append(xin)
-    x_window = np.concatenate(x_in_steps).astype(bfloat16)  # (seq_len*INPUT_DIM,)
+    # Pad each timestep's x_in from INPUT_DIM to INPUT_DIM_PADDED with zeros
+    # (matches the padded w_ih layout). x_in_steps stay unpadded for the golden.
+    _pad = np.zeros(INPUT_DIM_PADDED - INPUT_DIM, dtype=bfloat16)
+    x_window = np.concatenate(
+        [np.concatenate([s, _pad]) for s in x_in_steps]
+    ).astype(bfloat16)  # (seq_len*INPUT_DIM_PADDED,)
 
     # Golden latent: run the encode in float from the bf16-quantized inputs.
     w_ih = w_ih_bf.astype(np.float32)
