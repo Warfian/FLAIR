@@ -84,6 +84,17 @@ int verify_decoder(bf16 *h0, bf16 *params, bf16 *out, int /*SIZE*/,
 
   float mean_abs = static_cast<float>(sum_abs / TOTAL);
 
+  // Dump the NPU hidden_seq (float32, SEQ_LEN x HIDDEN_DIM) so the host script
+  // compare_anomaly_score.py can run hidden_to_output + MSE and compare the
+  // NPU-derived anomaly score against PyTorch.
+  {
+    std::ofstream fo("decoder_npu_hidden.bin", std::ios::binary);
+    for (int i = 0; i < TOTAL; i++) {
+      float v = test_utils::bfloat16_to_float(out[i]);
+      fo.write(reinterpret_cast<const char *>(&v), sizeof(float));
+    }
+  }
+
   std::cout << "decoder hidden_seq max abs error vs golden: " << max_abs
             << "  mean abs error: " << mean_abs << "  atol=" << VERIFY_ATOL
             << "  errors=" << errors << "/" << TOTAL << "\n";
