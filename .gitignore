@@ -214,3 +214,9 @@ npu/_build/
 npu/*.exe
 npu/*.bin
 npu/**/*.o
+
+# dataset-inference generated artifacts (npu/)
+npu/all_*.bin
+npu/enc_params.bin
+npu/dec_params.bin
+npu/*.csv
