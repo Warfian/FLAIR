@@ -20,7 +20,7 @@ HIDDEN_DIM = 64
 SEQ_LEN = 10
 OUTPUT_DIM = 21
 
-_CKPT = _REPO / "experiments" / "results" / "flair_minimal.pt"
+_CKPT = _REPO / "experiments" / "results" / "flair_80_10_10.pt"
 _NPZ = _REPO / "data" / "processed" / "preprocessed.npz"
 
 

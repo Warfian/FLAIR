@@ -34,7 +34,7 @@ HIDDEN_DIM = 64
 # Resolve paths relative to the repo root regardless of CWD.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
-_CKPT = _REPO / "experiments" / "results" / "flair_minimal.pt"
+_CKPT = _REPO / "experiments" / "results" / "flair_80_10_10.pt"
 _NPZ = _REPO / "data" / "processed" / "preprocessed.npz"
 
 

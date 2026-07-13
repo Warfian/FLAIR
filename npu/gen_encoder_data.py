@@ -30,7 +30,7 @@ SEQ_LEN = 10  # default; override with --seq-len (must match the kernel's SEQ_LE
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
-_CKPT = _REPO / "experiments" / "results" / "flair_minimal.pt"
+_CKPT = _REPO / "experiments" / "results" / "flair_80_10_10.pt"
 _NPZ = _REPO / "data" / "processed" / "preprocessed.npz"
 
 

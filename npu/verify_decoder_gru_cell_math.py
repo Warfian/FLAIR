@@ -33,7 +33,7 @@ import torch
 from src.models.flair_model import FLAIRAutoencoder, FLAIRConfig
 
 
-CHECKPOINT_PATH = Path("experiments/results/flair_minimal.pt")
+CHECKPOINT_PATH = Path("experiments/results/flair_80_10_10.pt")
 NPZ_PATH = Path("data/processed/preprocessed.npz")
 WINDOW_INDEX = 0
 
