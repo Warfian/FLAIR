@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -267,6 +268,14 @@ def main() -> None:
     if args.xrt_lib_dir:
         xf.append(f"XRT_LIB_DIR={args.xrt_lib_dir}")
     if not args.skip_build:
+        # ALWAYS delete .prj dirs before rebuilding. IRON/aiecc's own
+        # ExternalFunction build cache does not reliably invalidate on
+        # changes to included headers like gru_common.h (source_string is
+        # just two fixed #include lines, unaffected by what's inside them --
+        # see flair-npu-iron-kernel-gotchas memory item 10). Without this, a
+        # kernel edit can silently test stale, unchanged compiled code.
+        shutil.rmtree(_HERE / "build" / "gru.prj", ignore_errors=True)
+        shutil.rmtree(_HERE / "build" / "decoder.prj", ignore_errors=True)
         sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
             str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
             str(T), "--batch", str(B_enc), "--xclbin-path", "build/gru.xclbin",

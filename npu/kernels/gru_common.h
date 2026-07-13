@@ -52,6 +52,36 @@ sigmoid16(const aie::vector<bfloat16, 16> &x) {
   return aie::load_v<16>(out_arr);
 }
 
+// Computes sigmoid(x0) and sigmoid(x1) sharing ONE combined 32-element
+// scalar reciprocal pass instead of two separate 16-element ones (each
+// sigmoid16 call pays a store_v/scalar-loop/load_v round trip; merging two
+// of them into one halves that round-trip count). Only valid when x0/x1 are
+// independent of each other -- in gru_step's gate combine, r and z qualify
+// (both computed directly from gi/gh), but n does NOT (n_pre depends on r's
+// result, so it must be computed after r is known -- see gru_step).
+inline void sigmoid16x2(const aie::vector<bfloat16, 16> &x0,
+                        const aie::vector<bfloat16, 16> &x1,
+                        aie::vector<bfloat16, 16> &out0,
+                        aie::vector<bfloat16, 16> &out1) {
+  aie::vector<bfloat16, 16> zero = aie::broadcast<bfloat16, 16>(0.0f);
+  aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+
+  aie::vector<bfloat16, 16> e0 = to_v16bfloat16(getExpBf16(aie::sub(zero, x0)));
+  aie::vector<bfloat16, 16> e1 = to_v16bfloat16(getExpBf16(aie::sub(zero, x1)));
+
+  aie::vector<bfloat16, 16> denom0 = aie::add(one, e0);
+  aie::vector<bfloat16, 16> denom1 = aie::add(one, e1);
+
+  alignas(aie::vector_decl_align) bfloat16 denom_arr[32];
+  alignas(aie::vector_decl_align) bfloat16 out_arr[32];
+  aie::store_v(denom_arr, denom0);
+  aie::store_v(denom_arr + 16, denom1); // offset 16 elem = 32B, still aligned
+  for (int j = 0; j < 32; j++)
+    out_arr[j] = getInvBf16((float)denom_arr[j]);
+  out0 = aie::load_v<16>(out_arr);
+  out1 = aie::load_v<16>(out_arr + 16);
+}
+
 // tanh(x) = 2*sigmoid(2x) - 1.
 inline aie::vector<bfloat16, 16>
 tanh16(const aie::vector<bfloat16, 16> &x) {
@@ -139,18 +169,19 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
     aie::vector<bfloat16, 16> vgi_r = aie::load_v<16>(gi_r + i);
     aie::vector<bfloat16, 16> vgh_r = aie::load_v<16>(gh_r + i);
     aie::vector<bfloat16, 16> pre_r = aie::add(vgi_r, vgh_r);
-    aie::vector<bfloat16, 16> r = sigmoid16(pre_r);
 
     aie::vector<bfloat16, 16> vgi_z = aie::load_v<16>(gi_z + i);
     aie::vector<bfloat16, 16> vgh_z = aie::load_v<16>(gh_z + i);
     aie::vector<bfloat16, 16> pre_z = aie::add(vgi_z, vgh_z);
-    aie::vector<bfloat16, 16> z = sigmoid16(pre_z);
+
+    aie::vector<bfloat16, 16> r, z;
+    sigmoid16x2(pre_r, pre_z, r, z); // r, z independent -- one combined pass
 
     aie::vector<bfloat16, 16> vgi_n = aie::load_v<16>(gi_n + i);
     aie::vector<bfloat16, 16> vgh_n = aie::load_v<16>(gh_n + i);
     aie::vector<bfloat16, 16> r_gh_n = aie::mul(r, vgh_n);
     aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
-    aie::vector<bfloat16, 16> n = tanh16(n_pre);
+    aie::vector<bfloat16, 16> n = tanh16(n_pre); // depends on r, can't join above
 
     aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
     aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
@@ -195,18 +226,19 @@ inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
     aie::vector<bfloat16, 16> vgi_r = aie::load_v<16>(gi_r + i);
     aie::vector<bfloat16, 16> vgh_r = aie::load_v<16>(gh_r + i);
     aie::vector<bfloat16, 16> pre_r = aie::add(vgi_r, vgh_r);
-    aie::vector<bfloat16, 16> r = sigmoid16(pre_r);
 
     aie::vector<bfloat16, 16> vgi_z = aie::load_v<16>(gi_z + i);
     aie::vector<bfloat16, 16> vgh_z = aie::load_v<16>(gh_z + i);
     aie::vector<bfloat16, 16> pre_z = aie::add(vgi_z, vgh_z);
-    aie::vector<bfloat16, 16> z = sigmoid16(pre_z);
+
+    aie::vector<bfloat16, 16> r, z;
+    sigmoid16x2(pre_r, pre_z, r, z); // r, z independent -- one combined pass
 
     aie::vector<bfloat16, 16> vgi_n = aie::load_v<16>(gi_n + i);
     aie::vector<bfloat16, 16> vgh_n = aie::load_v<16>(gh_n + i);
     aie::vector<bfloat16, 16> r_gh_n = aie::mul(r, vgh_n);
     aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
-    aie::vector<bfloat16, 16> n = tanh16(n_pre);
+    aie::vector<bfloat16, 16> n = tanh16(n_pre); // depends on r, can't join above
 
     aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
     aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
