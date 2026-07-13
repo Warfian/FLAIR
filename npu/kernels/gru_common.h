@@ -174,15 +174,6 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
 //
 // `gi` MUST be 32-byte aligned (vector-loaded) and H3=3*HIDDEN_DIM long.
 // `h` MUST be 32-byte aligned and HIDDEN_DIM long, same as gru_step.
-//
-// DIAGNOSTIC: noinline. gru_step (used by the encoder) stays out-of-line in
-// a real loop (gru_encoder_impl is only 1152B). gru_step_with_gi, being
-// smaller (3408B vs gru_step's 6336B) after the gi-hoisting fix, appears to
-// cross the compiler's inline-cost threshold and gets fully unrolled 10x
-// into gru_decoder_bf16 (4688B) instead -- forcing it back out-of-line
-// tests whether that unrolling is helping or hurting the measured dispatch
-// time. See flair-decoder-dispatch-cost memory.
-__attribute__((noinline))
 inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
                              const bfloat16 *restrict w_hh,
                              const bfloat16 *restrict b_hh) {
