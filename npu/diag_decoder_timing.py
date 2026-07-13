@@ -3,19 +3,24 @@
 diag_decoder_timing.py  -- DIAGNOSTIC ONLY
 
 Isolates the source of the decoder's large fixed per-dispatch cost (~5.5x the
-encoder's, and which the fused variant made worse). Builds two decoder xclbins
-that do IDENTICAL compute (the full GRU sequence) and differ ONLY in output
-footprint, then times both through the same batch_infer.exe dispatch path:
+encoder's ~600us). Two prior rounds already ruled out output size (final vs
+unfused: ~3% apart) and redundant gi=w_ih@x_in recomputation (hoisting it out
+of the loop: ~0% change). This round asks a more basic question: is it
+compute at all? Builds THREE decoder xclbins with identical (h0, params,
+hidden_seq) buffer signature/sizes and identical ObjectFifo wiring, differing
+only in what the kernel body does:
 
-  * unfused  : writes the whole hidden_seq   (batch * SEQ_LEN * HIDDEN_DIM)
-  * final    : writes only the final hidden  (batch * HIDDEN_DIM)
+  * unfused : full GRU sequence, writes the whole hidden_seq
+  * final   : full GRU sequence, writes only the final hidden state
+  * noop    : NO gru_step calls at all -- same buffers/wiring, ~no compute
 
 Interpretation of the reported us/dispatch:
-  * if `final` collapses toward the encoder's ~600us while `unfused` stays
-    ~3300us  -> the decoder floor is the per-timestep output writes / the
-    larger output DMA. Fix: restructure the output.
-  * if `final` stays ~3300us too -> the floor is the gru_step compilation in
-    the decoder design itself, independent of output size. Look there instead.
+  * if `noop` ALSO shows ~3300us -> the floor isn't compute at all; it's
+    structural to how this xclbin dispatches (tile placement, DMA/buffer
+    setup at compile time, etc.), independent of the kernel body.
+  * if `noop` collapses toward the encoder's ~600us -> the floor really is
+    in the gru_step compute path, and the first two rounds just didn't hit
+    the right piece of it yet.
 
 Inputs are synthetic (small random) -- only timing matters here, not values.
 
@@ -93,6 +98,10 @@ def main() -> None:
             str(H), "--seq-len", str(T), "--batch", str(B), "--xclbin-path",
             "build/decoder_final.xclbin", "--insts-path",
             "build/decoder_final_insts.bin"])
+        sh(["python3", "gru_decoder_noop.py", "--dev", "npu", "--hidden-dim",
+            str(H), "--seq-len", str(T), "--batch", str(B), "--xclbin-path",
+            "build/decoder_noop.xclbin", "--insts-path",
+            "build/decoder_noop_insts.bin"])
         sh(["make", "-f", "Makefile.batch"])
 
     results = {}
@@ -111,6 +120,13 @@ def main() -> None:
         str(H)])
     results["final"] = parse_us_per_window(out)
 
+    print("\n[noop] no gru_step calls, same buffers/wiring as unfused")
+    out = sh_capture([ps, "./batch_infer.exe", "build/decoder_noop.xclbin",
+        "build/decoder_noop_insts.bin", "diag_h0.bin", "diag_params.bin",
+        "diag_out_noop.bin", str(N), str(B), str(H), str(n_params),
+        str(T * H)])
+    results["noop"] = parse_us_per_window(out)
+
     print("\n" + "=" * 64)
     print(f"Decoder fixed-cost isolation  (batch={B}, N={N})")
     print("=" * 64)
@@ -121,11 +137,11 @@ def main() -> None:
             print(f"  {name:8s}: {us_win:8.1f} us/window  ->  "
                   f"{us_win * B:8.1f} us/dispatch")
     print("-" * 64)
-    if results.get("unfused") and results.get("final"):
-        drop = (results["unfused"] - results["final"]) / results["unfused"] * 100
-        print(f"  final vs unfused per-dispatch: {drop:+.1f}% "
-              f"(large drop -> output writes are the floor; "
-              f"~0 -> gru_step compilation is)")
+    if results.get("unfused") and results.get("noop"):
+        drop = (results["unfused"] - results["noop"]) / results["unfused"] * 100
+        print(f"  noop vs unfused per-dispatch: {drop:+.1f}% "
+              f"(large drop -> the floor IS compute-related after all; "
+              f"~0 -> floor is structural/dispatch-related, not compute)")
     print("=" * 64)
 
 

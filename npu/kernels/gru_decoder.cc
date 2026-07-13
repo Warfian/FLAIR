@@ -193,3 +193,37 @@ extern "C" void gru_decoder_final_bf16(
         }
     }
 }
+
+// DIAGNOSTIC ONLY -- does virtually no compute. Same (h0, params,
+// hidden_seq) argument signature and buffer sizes as gru_decoder_bf16, and
+// the SAME ObjectFifo/acquire-release wiring (so params still gets DMA'd in,
+// same ack/release pattern), but calls NO gru_step at all. Purpose: if this
+// STILL shows the ~3300us/dispatch floor, the cost is not about on-core
+// compute at all -- it's structural to how THIS xclbin gets dispatched
+// (tile placement, buffer/DMA setup at compile time, etc.), independent of
+// what code runs on the core. Not used for scoring.
+extern "C" void gru_decoder_noop_bf16(
+    bfloat16 *h0_vec,
+    bfloat16 *params,
+    bfloat16 *hidden_seq
+) {
+    constexpr int H = HIDDEN_DIM;
+
+    for (int b = 0; b < BATCH; b++) {
+        bfloat16 *h0_vec_b = h0_vec + b * H;
+        bfloat16 *hidden_seq_b = hidden_seq + b * SEQ_LEN * H;
+
+        // Touch params (one element) so it isn't compiled away entirely,
+        // without doing any real matvec/gate compute.
+        bfloat16 touch = params[0];
+
+        for (int i = 0; i < H; i++) {
+            hidden_seq_b[i] = h0_vec_b[i] + touch - touch; // == h0_vec_b[i]
+        }
+        for (int t = 1; t < SEQ_LEN; t++) {
+            for (int i = 0; i < H; i++) {
+                hidden_seq_b[t * H + i] = (bfloat16)0.0f;
+            }
+        }
+    }
+}
