@@ -265,6 +265,11 @@ def main() -> None:
         [w_ih_d.reshape(-1), w_hh_d.reshape(-1), b_ih_d, b_hh_d,
          w_out_d.reshape(-1), b_out_d]
     ).astype(bfloat16)
+    if dec_params.size % 2 != 0:
+        # Shim DMA transfer length must be a multiple of 4 bytes (2 bf16
+        # elements); b_out (21, odd) tips the total odd. Pad with one
+        # trailing zero to match gru_decoder_fused.py's buffer size.
+        dec_params = np.concatenate([dec_params, np.zeros(1, dtype=bfloat16)])
     (_HERE / "dec_params.bin").write_bytes(dec_params.tobytes())
     n_dec_params = dec_params.size
 

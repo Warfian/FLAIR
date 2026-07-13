@@ -88,6 +88,12 @@ def gru_decoder_fused(
         + output_dim * hidden_dim  # w_out
         + output_dim  # b_out
     )
+    # Shim DMA transfer length must be a multiple of 4 bytes; bf16 is 2
+    # bytes/element, so an odd element count (b_out=21 tips this odd) needs
+    # one trailing pad element. Host side pads dec_params to match (see
+    # run_dataset_inference.py).
+    if n_params % 2 != 0:
+        n_params += 1
 
     dtype = np.dtype[bfloat16]
 
