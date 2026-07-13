@@ -150,3 +150,45 @@ extern "C" void gru_decoder_fused_bf16(
         }
     }
 }
+
+// DIAGNOSTIC ONLY -- not part of the scoring pipeline. Runs the exact same
+// full GRU sequence as gru_decoder_bf16, but writes ONLY the final hidden
+// state (BATCH*HIDDEN_DIM output, like the encoder's latent) instead of the
+// whole hidden_seq (BATCH*SEQ_LEN*HIDDEN_DIM). Purpose: isolate whether the
+// decoder's large fixed per-dispatch cost (~5.5x the encoder's) comes from
+// the per-timestep output writes / larger output DMA, or from the gru_step
+// compute itself. Identical compute to gru_decoder_bf16; only the output
+// footprint differs (batch*64 vs batch*640).
+extern "C" void gru_decoder_final_bf16(
+    bfloat16 *h0_vec,
+    bfloat16 *params,
+    bfloat16 *final_h
+) {
+    constexpr int H = HIDDEN_DIM;
+    constexpr int H3 = 3 * H;
+    constexpr int INPUT_DIM = HIDDEN_DIM;
+
+    bfloat16 *w_ih = params;
+    bfloat16 *w_hh = w_ih + H3 * INPUT_DIM;
+    bfloat16 *b_ih = w_hh + H3 * H;
+    bfloat16 *b_hh = b_ih + H3;
+
+    for (int b = 0; b < BATCH; b++) {
+        bfloat16 *h0_vec_b = h0_vec + b * H;
+        bfloat16 *final_h_b = final_h + b * H;
+
+        alignas(aie::vector_decl_align) bfloat16 h[H];
+        for (int i = 0; i < H; i++) {
+            h[i] = h0_vec_b[i];
+        }
+
+        for (int t = 0; t < SEQ_LEN; t++) {
+            flair::gru_step(h0_vec_b, h, w_ih, w_hh, b_ih, b_hh, INPUT_DIM);
+        }
+
+        // Write ONLY the final hidden state (batch*H total).
+        for (int i = 0; i < H; i++) {
+            final_h_b[i] = h[i];
+        }
+    }
+}
