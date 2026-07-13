@@ -227,3 +227,53 @@ extern "C" void gru_decoder_noop_bf16(
         }
     }
 }
+
+// DIAGNOSTIC ONLY -- bisects noop vs unfused. Does the SAME w_hh @ h matvec
+// as gru_step_with_gi, every timestep, but skips the sigmoid/tanh
+// gate-combine loop entirely (just copies gh's first H elements into h --
+// garbage values, timing only). If this collapses toward the noop floor,
+// the gate-combine loop (specifically sigmoid16's scalar getInvBf16
+// reciprocal loop, ~12 calls/timestep) is the expensive part, not the
+// matvec. If it stays near unfused's ~3300us/dispatch, the matvec itself is
+// the culprit. Not used for scoring.
+extern "C" void gru_decoder_matvec_only_bf16(
+    bfloat16 *h0_vec,
+    bfloat16 *params,
+    bfloat16 *hidden_seq
+) {
+    constexpr int H = HIDDEN_DIM;
+    constexpr int H3 = 3 * H;
+    constexpr int INPUT_DIM = HIDDEN_DIM;
+
+    bfloat16 *w_ih = params;
+    bfloat16 *w_hh = w_ih + H3 * INPUT_DIM;
+    bfloat16 *b_ih = w_hh + H3 * H;
+    bfloat16 *b_hh = b_ih + H3;
+
+    for (int b = 0; b < BATCH; b++) {
+        bfloat16 *h0_vec_b = h0_vec + b * H;
+        bfloat16 *hidden_seq_b = hidden_seq + b * SEQ_LEN * H;
+
+        alignas(aie::vector_decl_align) bfloat16 h[H];
+        for (int i = 0; i < H; i++) {
+            h[i] = h0_vec_b[i];
+        }
+
+        (void)w_ih; (void)b_ih; // unused here (matches gru_step_with_gi's shape)
+
+        for (int t = 0; t < SEQ_LEN; t++) {
+            alignas(aie::vector_decl_align) bfloat16 gh[H3];
+            flair::matvec_bias(w_hh, h, b_hh, gh, H3, H); // same matvec as gru_step_with_gi
+
+            // No sigmoid/tanh at all -- just take gh's first H elements as
+            // the "new" h (garbage values, but same memory traffic shape).
+            for (int i = 0; i < H; i++) {
+                h[i] = gh[i];
+            }
+
+            for (int i = 0; i < H; i++) {
+                hidden_seq_b[t * H + i] = h[i];
+            }
+        }
+    }
+}

@@ -3,24 +3,30 @@
 diag_decoder_timing.py  -- DIAGNOSTIC ONLY
 
 Isolates the source of the decoder's large fixed per-dispatch cost (~5.5x the
-encoder's ~600us). Two prior rounds already ruled out output size (final vs
-unfused: ~3% apart) and redundant gi=w_ih@x_in recomputation (hoisting it out
-of the loop: ~0% change). This round asks a more basic question: is it
-compute at all? Builds THREE decoder xclbins with identical (h0, params,
-hidden_seq) buffer signature/sizes and identical ObjectFifo wiring, differing
-only in what the kernel body does:
+encoder's ~600us). Proven so far:
+  * NOT output size (final vs unfused: ~3% apart)
+  * NOT the redundant gi=w_ih@x_in recomputation (hoisting it: ~0% change)
+  * IS real on-core compute (noop, with no gru_step calls at all, collapsed
+    from ~3300us/dispatch to ~200us/dispatch)
 
-  * unfused : full GRU sequence, writes the whole hidden_seq
-  * final   : full GRU sequence, writes only the final hidden state
-  * noop    : NO gru_step calls at all -- same buffers/wiring, ~no compute
+Since hoisting gi (removing the w_ih matvec) didn't help, this round bisects
+what's LEFT in gru_step_with_gi: the w_hh matvec, or the sigmoid/tanh
+gate-combine loop that follows it (which is IDENTICAL code to what the
+encoder runs the same number of times, yet the encoder shows ~0 measurable
+cost for it). Builds FOUR decoder xclbins, same buffer signature/wiring:
 
-Interpretation of the reported us/dispatch:
-  * if `noop` ALSO shows ~3300us -> the floor isn't compute at all; it's
-    structural to how this xclbin dispatches (tile placement, DMA/buffer
-    setup at compile time, etc.), independent of the kernel body.
-  * if `noop` collapses toward the encoder's ~600us -> the floor really is
-    in the gru_step compute path, and the first two rounds just didn't hit
-    the right piece of it yet.
+  * unfused     : full GRU sequence, writes the whole hidden_seq
+  * final       : full GRU sequence, writes only the final hidden state
+  * noop        : NO gru_step calls at all -- ~no compute
+  * matvec_only : w_hh @ h matvec every timestep, but NO sigmoid/tanh at all
+
+Interpretation of matvec_only vs unfused/noop:
+  * matvec_only near noop  -> the gate-combine loop (specifically sigmoid16's
+    scalar getInvBf16 reciprocal loop, ~12 calls/timestep) is the expensive
+    part, not the matvec.
+  * matvec_only near unfused -> the w_hh matvec itself is the culprit
+    (surprising -- would need a different explanation for why it's cheap in
+    the encoder but not here).
 
 Inputs are synthetic (small random) -- only timing matters here, not values.
 
@@ -102,6 +108,10 @@ def main() -> None:
             str(H), "--seq-len", str(T), "--batch", str(B), "--xclbin-path",
             "build/decoder_noop.xclbin", "--insts-path",
             "build/decoder_noop_insts.bin"])
+        sh(["python3", "gru_decoder_matvec_only.py", "--dev", "npu",
+            "--hidden-dim", str(H), "--seq-len", str(T), "--batch", str(B),
+            "--xclbin-path", "build/decoder_matvec_only.xclbin",
+            "--insts-path", "build/decoder_matvec_only_insts.bin"])
         sh(["make", "-f", "Makefile.batch"])
 
     results = {}
@@ -127,21 +137,32 @@ def main() -> None:
         str(T * H)])
     results["noop"] = parse_us_per_window(out)
 
+    print("\n[matvec_only] w_hh @ h every timestep, no sigmoid/tanh at all")
+    out = sh_capture([ps, "./batch_infer.exe", "build/decoder_matvec_only.xclbin",
+        "build/decoder_matvec_only_insts.bin", "diag_h0.bin", "diag_params.bin",
+        "diag_out_matvec_only.bin", str(N), str(B), str(H), str(n_params),
+        str(T * H)])
+    results["matvec_only"] = parse_us_per_window(out)
+
     print("\n" + "=" * 64)
     print(f"Decoder fixed-cost isolation  (batch={B}, N={N})")
     print("=" * 64)
     for name, us_win in results.items():
         if us_win is None:
-            print(f"  {name:8s}: (could not parse timing)")
+            print(f"  {name:14s}: (could not parse timing)")
         else:
-            print(f"  {name:8s}: {us_win:8.1f} us/window  ->  "
+            print(f"  {name:14s}: {us_win:8.1f} us/window  ->  "
                   f"{us_win * B:8.1f} us/dispatch")
     print("-" * 64)
     if results.get("unfused") and results.get("noop"):
         drop = (results["unfused"] - results["noop"]) / results["unfused"] * 100
-        print(f"  noop vs unfused per-dispatch: {drop:+.1f}% "
-              f"(large drop -> the floor IS compute-related after all; "
-              f"~0 -> floor is structural/dispatch-related, not compute)")
+        print(f"  noop vs unfused per-dispatch: {drop:+.1f}%")
+    if results.get("unfused") and results.get("matvec_only") and results.get("noop"):
+        u, m, n = results["unfused"] * B, results["matvec_only"] * B, results["noop"] * B
+        gate_share = (u - m) / (u - n) * 100 if (u - n) else float("nan")
+        matvec_share = (m - n) / (u - n) * 100 if (u - n) else float("nan")
+        print(f"  of the compute cost (unfused-noop): "
+              f"gate-combine loop ~{gate_share:.0f}%, matvec ~{matvec_share:.0f}%")
     print("=" * 64)
 
 
