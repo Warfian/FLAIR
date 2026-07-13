@@ -62,7 +62,7 @@ def main():
     cfg = FLAIRConfig(**ckpt["model_cfg"])
 
     model = FLAIRAutoencoder(cfg)
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)  # checkpoint may include unused cat-loss heads
     model.eval()
 
     bundle = np.load(str(_NPZ), allow_pickle=True)
