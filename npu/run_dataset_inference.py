@@ -25,8 +25,10 @@ Usage (from npu/):
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +49,65 @@ _CKPT = _REPO / "experiments" / "results" / "flair_80_10_10.pt"
 def sh(cmd: list[str], **kw) -> None:
     print("$ " + " ".join(cmd))
     subprocess.run(cmd, cwd=_HERE, check=True, **kw)
+
+
+def sh_capture(cmd: list[str], **kw) -> str:
+    """Like sh(), but also returns captured stdout (still echoed live-ish after the call)."""
+    print("$ " + " ".join(cmd))
+    result = subprocess.run(cmd, cwd=_HERE, check=True, capture_output=True, text=True, **kw)
+    print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.stdout
+
+
+def parse_us_per_window(stdout: str) -> float | None:
+    m = re.search(r"([\d.]+)\s*us/window", stdout)
+    return float(m.group(1)) if m else None
+
+
+def cpu_single_window_latency(
+    model, X_num: np.ndarray, X_cat: np.ndarray, *,
+    threads: int, use_torchscript: bool, warmup: int, iters: int,
+) -> float:
+    """Fair single-window (batch=1) CPU latency in us/window, cycling through
+    real dataset windows. Mirrors scripts/benchmark_inference.py's methodology
+    so this is comparable to the previously-established CPU baseline."""
+    import torch
+    from scripts.benchmark_inference import AnomalyScoreWrapper
+
+    default_threads = torch.get_num_threads()
+    torch.set_num_threads(threads)
+    N = X_num.shape[0]
+
+    if use_torchscript:
+        wrapper = AnomalyScoreWrapper(model).eval()
+        x0 = torch.from_numpy(X_num[:1])
+        c0 = torch.from_numpy(X_cat[:1])
+        with torch.no_grad():
+            traced = torch.jit.trace(wrapper, (x0, c0))
+        traced.eval()
+
+        def call(i: int) -> None:
+            with torch.no_grad():
+                traced(torch.from_numpy(X_num[i:i + 1]), torch.from_numpy(X_cat[i:i + 1]))
+    else:
+        def call(i: int) -> None:
+            with torch.no_grad():
+                model.anomaly_score(
+                    torch.from_numpy(X_num[i:i + 1]), torch.from_numpy(X_cat[i:i + 1])
+                )
+
+    for i in range(min(warmup, N)):
+        call(i % N)
+
+    t0 = time.perf_counter()
+    for i in range(iters):
+        call(i % N)
+    t1 = time.perf_counter()
+
+    torch.set_num_threads(default_threads)
+    return (t1 - t0) * 1e6 / iters
 
 
 def sigmoid(x):
@@ -105,6 +166,10 @@ def main() -> None:
     p.add_argument("--xrt-lib-dir", type=str, default=None)
     p.add_argument("--skip-build", action="store_true",
                    help="reuse existing xclbins + batch_infer.exe")
+    p.add_argument("--skip-cpu-baseline", action="store_true",
+                   help="skip the CPU single-window latency comparison")
+    p.add_argument("--cpu-warmup-iters", type=int, default=50)
+    p.add_argument("--cpu-timed-iters", type=int, default=500)
     args = p.parse_args()
     T = args.seq_len
 
@@ -184,9 +249,10 @@ def main() -> None:
 
     # --- 2. NPU encoder pass ---
     print("\n[encoder] batched NPU pass")
-    sh([ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
+    enc_stdout = sh_capture([ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
         "all_x_windows.bin", "enc_params.bin", "all_latents.bin",
         str(N), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
+    enc_us_per_window = parse_us_per_window(enc_stdout)
 
     # --- 3. latent -> h0 (host) ---
     latents = np.frombuffer((_HERE / "all_latents.bin").read_bytes(),
@@ -198,10 +264,11 @@ def main() -> None:
 
     # --- 4. NPU decoder pass ---
     print("\n[decoder] batched NPU pass")
-    sh([ps, "./batch_infer.exe", "build/decoder.xclbin",
+    dec_stdout = sh_capture([ps, "./batch_infer.exe", "build/decoder.xclbin",
         "build/decoder_insts.bin", "all_h0.bin", "dec_params.bin",
         "all_hidden.bin", str(N), str(HIDDEN_DIM), str(n_dec_params),
         str(T * HIDDEN_DIM)])
+    dec_us_per_window = parse_us_per_window(dec_stdout)
 
     # --- 5. hidden -> recon -> NPU MSE scores (host) ---
     hidden = np.frombuffer((_HERE / "all_hidden.bin").read_bytes(),
@@ -242,6 +309,40 @@ def main() -> None:
         for i in range(N):
             f.write(f"{i},{int(y[i])},{npu_scores[i]:.6f},{pt_scores[i]:.6f}\n")
     print(f"per-window scores -> {out_csv}")
+
+    # --- 7. NPU vs CPU speed comparison ---
+    if not args.skip_cpu_baseline:
+        import torch
+
+        default_threads = torch.get_num_threads()
+        print(f"\n[cpu baseline] single-window (batch=1) latency, "
+              f"{args.cpu_warmup_iters} warmup + {args.cpu_timed_iters} timed calls")
+        cpu_eager_us = cpu_single_window_latency(
+            model, X_num, X_cat, threads=default_threads, use_torchscript=False,
+            warmup=args.cpu_warmup_iters, iters=args.cpu_timed_iters,
+        )
+        cpu_ts_us = cpu_single_window_latency(
+            model, X_num, X_cat, threads=1, use_torchscript=True,
+            warmup=args.cpu_warmup_iters, iters=args.cpu_timed_iters,
+        )
+
+        print("\n" + "=" * 64)
+        print("NPU vs CPU inference speed  (per window, full encoder+decoder)")
+        print("=" * 64)
+        if enc_us_per_window is not None and dec_us_per_window is not None:
+            npu_us = enc_us_per_window + dec_us_per_window
+            print(f"  NPU   (encoder {enc_us_per_window:.1f} + decoder "
+                  f"{dec_us_per_window:.1f}, incl. host sync) : {npu_us:8.1f} us/window")
+        else:
+            npu_us = None
+            print("  NPU   : could not parse per-window timing from batch_infer.exe output")
+        print(f"  CPU   eager       (default threads={default_threads})   : {cpu_eager_us:8.1f} us/window")
+        print(f"  CPU   TorchScript (1 thread, fair baseline) : {cpu_ts_us:8.1f} us/window")
+        if npu_us is not None:
+            print("-" * 64)
+            print(f"  Speedup vs CPU eager (default threads) : {cpu_eager_us / npu_us:.2f}x")
+            print(f"  Speedup vs CPU fair baseline (TS/1thr)  : {cpu_ts_us / npu_us:.2f}x")
+        print("=" * 64)
 
 
 if __name__ == "__main__":
