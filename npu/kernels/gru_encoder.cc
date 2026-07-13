@@ -39,6 +39,13 @@ using namespace aie;
 #ifndef SEQ_LEN
 #define SEQ_LEN 10
 #endif
+// Number of windows processed per kernel invocation. params (weights) are
+// resident and shared across the whole batch -- only x_window/latent grow
+// with BATCH. Defaults to 1 (identical to the original single-window
+// behavior) so existing single-window callers are unaffected.
+#ifndef BATCH
+#define BATCH 1
+#endif
 
 #include "gru_common.h"
 
@@ -51,25 +58,32 @@ void gru_encoder_impl(bfloat16 *restrict x_window, bfloat16 *restrict params,
   constexpr int T = SEQ_LEN;
 
   // params layout: w_ih (H3*INPUT_DIM) | w_hh (H3*H) | b_ih (H3) | b_hh (H3)
+  // Shared across all BATCH windows -- loaded once, read BATCH times.
   const bfloat16 *restrict w_ih = params;
   const bfloat16 *restrict w_hh = params + H3 * INPUT_DIM;
   const bfloat16 *restrict b_ih = w_hh + H3 * H;
   const bfloat16 *restrict b_hh = b_ih + H3;
 
-  // Resident hidden state, initialized to zero, carried across timesteps.
-  alignas(aie::vector_decl_align) bfloat16 h[H];
-  for (int i = 0; i < H; i++)
-    h[i] = (bfloat16)0.0f;
+  for (int b = 0; b < BATCH; b++) {
+    bfloat16 *restrict x_window_b = x_window + b * T * INPUT_DIM;
+    bfloat16 *restrict latent_b = latent + b * H;
 
-  for (int t = 0; t < T; t++) {
-    // x_window[t] is a length-INPUT_DIM slice at element offset t*INPUT_DIM.
-    // gru_step reads x_in scalar-only, so this unaligned offset is fine.
-    const bfloat16 *restrict x_t = x_window + t * INPUT_DIM;
-    flair::gru_step(x_t, h, w_ih, w_hh, b_ih, b_hh, INPUT_DIM);
+    // Resident hidden state, initialized to zero, carried across timesteps.
+    alignas(aie::vector_decl_align) bfloat16 h[H];
+    for (int i = 0; i < H; i++)
+      h[i] = (bfloat16)0.0f;
+
+    for (int t = 0; t < T; t++) {
+      // x_window_b[t] is a length-INPUT_DIM slice at element offset
+      // t*INPUT_DIM. gru_step reads x_in scalar-only, so this unaligned
+      // offset is fine.
+      const bfloat16 *restrict x_t = x_window_b + t * INPUT_DIM;
+      flair::gru_step(x_t, h, w_ih, w_hh, b_ih, b_hh, INPUT_DIM);
+    }
+
+    for (int i = 0; i < H; i++)
+      latent_b[i] = h[i];
   }
-
-  for (int i = 0; i < H; i++)
-    latent[i] = h[i];
 
   event1();
 }

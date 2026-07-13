@@ -10,6 +10,7 @@ HIDDEN_DIM ?= 64
 SEQ_LEN ?= 10
 N_PARAMS ?= 24960
 WINDOW_INDEX ?= 0
+BATCH ?= 1  # windows per kernel invocation; params stay a single shared copy
 
 XRT_FLAGS =
 ifdef XRT_INC_DIR
@@ -25,7 +26,7 @@ insts_target = build/decoder_insts.bin
 .PHONY: all
 all: ${xclbin_target} ${insts_target} data
 
-$(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${devicename} --hidden-dim ${HIDDEN_DIM} --seq-len ${SEQ_LEN}))
+$(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${devicename} --hidden-dim ${HIDDEN_DIM} --seq-len ${SEQ_LEN} --batch ${BATCH}))
 
 ${xclbin_target} ${insts_target}: ${srcdir}/kernels/gru_decoder.cc ${srcdir}/kernels/gru_common.h
 

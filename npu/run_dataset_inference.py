@@ -20,6 +20,7 @@ XRT paths for the host build via --xrt-inc-dir / --xrt-lib-dir.
 Usage (from npu/):
     python3 run_dataset_inference.py --limit 990        # full sample dataset
     python3 run_dataset_inference.py --npz /path/to/other.npz --limit 0
+    python3 run_dataset_inference.py --batch 8 --limit 0  # batch windows/dispatch
 """
 
 from __future__ import annotations
@@ -170,8 +171,13 @@ def main() -> None:
                    help="skip the CPU single-window latency comparison")
     p.add_argument("--cpu-warmup-iters", type=int, default=50)
     p.add_argument("--cpu-timed-iters", type=int, default=500)
+    p.add_argument("--batch", type=int, default=8,
+                   help="windows processed per NPU kernel dispatch (amortizes "
+                        "host<->device launch/sync overhead across `batch` "
+                        "windows instead of paying it per window)")
     args = p.parse_args()
     T = args.seq_len
+    B = args.batch
 
     ckpt = torch.load(str(_CKPT), map_location="cpu")
     sd = ckpt["model_state_dict"]
@@ -188,11 +194,20 @@ def main() -> None:
     X_num, X_cat, y = X_num[:N], X_cat[:N], y[:N]
     print(f"Dataset: {N} windows, {int(y.sum())} anomalies, T={T}")
 
+    # NPU kernels process B windows per dispatch (see --batch); pad the
+    # window count up to a multiple of B so every dispatch is full-sized.
+    # The extra rows are all-zero inputs; their outputs are discarded before
+    # scoring, below.
+    N_pad = ((N + B - 1) // B) * B
+    if N_pad != N:
+        print(f"Padding {N} -> {N_pad} windows to fill batch={B} "
+              f"(extra {N_pad - N} rows discarded before scoring)")
+
     # --- 1. Encoder inputs: embeddings + pad to 48 per timestep ---
     sport_w = sd["sport_emb.weight"].numpy()
     dport_w = sd["dport_emb.weight"].numpy()
     proto_w = sd["proto_emb.weight"].numpy()
-    x_windows = np.zeros((N, T, INPUT_DIM_PADDED), dtype=bfloat16)
+    x_windows = np.zeros((N_pad, T, INPUT_DIM_PADDED), dtype=bfloat16)
     for w in range(N):
         for t in range(T):
             xin = np.concatenate([
@@ -202,7 +217,7 @@ def main() -> None:
                 proto_w[X_cat[w, t, 2]],
             ]).astype(bfloat16)
             x_windows[w, t, :INPUT_DIM] = xin  # last 3 stay 0 (pad)
-    (_HERE / "all_x_windows.bin").write_bytes(x_windows.reshape(N, -1).tobytes())
+    (_HERE / "all_x_windows.bin").write_bytes(x_windows.reshape(N_pad, -1).tobytes())
 
     # Encoder params (padded w_ih), matching gen_encoder_data.py.
     w_ih_e = sd["encoder.gru.weight_ih_l0"].numpy().astype(bfloat16)
@@ -238,11 +253,12 @@ def main() -> None:
     if not args.skip_build:
         sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
             str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
-            str(T), "--xclbin-path", "build/gru.xclbin", "--insts-path",
-            "build/insts.bin"])
+            str(T), "--batch", str(B), "--xclbin-path", "build/gru.xclbin",
+            "--insts-path", "build/insts.bin"])
         sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim",
-            str(HIDDEN_DIM), "--seq-len", str(T), "--xclbin-path",
-            "build/decoder.xclbin", "--insts-path", "build/decoder_insts.bin"])
+            str(HIDDEN_DIM), "--seq-len", str(T), "--batch", str(B),
+            "--xclbin-path", "build/decoder.xclbin", "--insts-path",
+            "build/decoder_insts.bin"])
         sh(["make", "-f", "Makefile.batch"] + xf)
 
     ps = "powershell.exe"
@@ -251,28 +267,29 @@ def main() -> None:
     print("\n[encoder] batched NPU pass")
     enc_stdout = sh_capture([ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
         "all_x_windows.bin", "enc_params.bin", "all_latents.bin",
-        str(N), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
+        str(N_pad), str(B), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
     enc_us_per_window = parse_us_per_window(enc_stdout)
 
     # --- 3. latent -> h0 (host) ---
     latents = np.frombuffer((_HERE / "all_latents.bin").read_bytes(),
-                            dtype=bfloat16).reshape(N, HIDDEN_DIM).astype(np.float32)
+                            dtype=bfloat16).reshape(N_pad, HIDDEN_DIM).astype(np.float32)
     W_lh = sd["decoder.latent_to_hidden.weight"].numpy().astype(np.float32)
     b_lh = sd["decoder.latent_to_hidden.bias"].numpy().astype(np.float32)
-    h0 = np.tanh(latents @ W_lh.T + b_lh).astype(bfloat16)  # (N, 64)
+    h0 = np.tanh(latents @ W_lh.T + b_lh).astype(bfloat16)  # (N_pad, 64)
     (_HERE / "all_h0.bin").write_bytes(h0.tobytes())
 
     # --- 4. NPU decoder pass ---
     print("\n[decoder] batched NPU pass")
     dec_stdout = sh_capture([ps, "./batch_infer.exe", "build/decoder.xclbin",
         "build/decoder_insts.bin", "all_h0.bin", "dec_params.bin",
-        "all_hidden.bin", str(N), str(HIDDEN_DIM), str(n_dec_params),
+        "all_hidden.bin", str(N_pad), str(B), str(HIDDEN_DIM), str(n_dec_params),
         str(T * HIDDEN_DIM)])
     dec_us_per_window = parse_us_per_window(dec_stdout)
 
     # --- 5. hidden -> recon -> NPU MSE scores (host) ---
+    # Discard the N_pad-N padding rows now, before scoring.
     hidden = np.frombuffer((_HERE / "all_hidden.bin").read_bytes(),
-                           dtype=bfloat16).reshape(N, T, HIDDEN_DIM).astype(np.float32)
+                           dtype=bfloat16).reshape(N_pad, T, HIDDEN_DIM).astype(np.float32)[:N]
     W_out = sd["decoder.hidden_to_output.weight"].numpy().astype(np.float32)
     b_out = sd["decoder.hidden_to_output.bias"].numpy().astype(np.float32)
     recon = hidden @ W_out.T + b_out                       # (N, T, 21)
@@ -327,7 +344,7 @@ def main() -> None:
         )
 
         print("\n" + "=" * 64)
-        print("NPU vs CPU inference speed  (per window, full encoder+decoder)")
+        print(f"NPU vs CPU inference speed  (per window, full encoder+decoder, batch={B})")
         print("=" * 64)
         if enc_us_per_window is not None and dec_us_per_window is not None:
             npu_us = enc_us_per_window + dec_us_per_window

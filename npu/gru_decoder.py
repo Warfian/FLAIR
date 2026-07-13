@@ -26,6 +26,10 @@ KERNEL_SRC = KERNELS_DIR / "gru_decoder.cc"
 
 HIDDEN_DIM = 64
 SEQ_LEN = 10
+# Windows processed per kernel invocation. params (weights) stay a single
+# copy, shared across the batch -- only h0_vec/hidden_seq scale with BATCH.
+# Default 1 = identical behavior to the original single-window design.
+BATCH = 1
 
 
 def _make_decoder_kernel(arg_types, compile_flags):
@@ -59,6 +63,7 @@ def gru_decoder(
     *,
     hidden_dim: CompileTime[int] = HIDDEN_DIM,
     seq_len: CompileTime[int] = SEQ_LEN,
+    batch: CompileTime[int] = BATCH,
 ):
     h3 = 3 * hidden_dim
 
@@ -67,15 +72,16 @@ def gru_decoder(
 
     dtype = np.dtype[bfloat16]
 
-    h0_ty = np.ndarray[(hidden_dim,), dtype]
+    h0_ty = np.ndarray[(batch * hidden_dim,), dtype]
     params_ty = np.ndarray[(n_params,), dtype]
-    hidden_seq_ty = np.ndarray[(seq_len * hidden_dim,), dtype]
+    hidden_seq_ty = np.ndarray[(batch * seq_len * hidden_dim,), dtype]
 
     kernel = _make_decoder_kernel(
         arg_types=[h0_ty, params_ty, hidden_seq_ty],
         compile_flags=[
             f"-DHIDDEN_DIM={hidden_dim}",
             f"-DSEQ_LEN={seq_len}",
+            f"-DBATCH={batch}",
         ],
     )
 
@@ -127,6 +133,8 @@ def _make_argparser():
     add_compile_args(p)
     p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM)
     p.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    p.add_argument("--batch", type=int, default=BATCH,
+                   help="windows processed per kernel invocation")
     return p
 
 
@@ -134,6 +142,7 @@ def _compile_kwargs(opts):
     return dict(
         hidden_dim=opts.hidden_dim,
         seq_len=opts.seq_len,
+        batch=opts.batch,
     )
 
 

@@ -37,6 +37,10 @@ _KERNEL_SRC = _KERNELS_DIR / "gru_encoder.cc"
 INPUT_DIM = 48
 HIDDEN_DIM = 64
 SEQ_LEN = 10  # preprocess.window_size in config.yaml
+# Windows processed per kernel invocation. params (weights) stay a single
+# copy, shared across the batch -- only x_window/latent scale with BATCH.
+# Default 1 = identical behavior to the original single-window design.
+BATCH = 1
 
 
 def _make_encoder_kernel(arg_types, compile_flags):
@@ -74,15 +78,17 @@ def gru_encoder(
     input_dim: CompileTime[int] = INPUT_DIM,
     hidden_dim: CompileTime[int] = HIDDEN_DIM,
     seq_len: CompileTime[int] = SEQ_LEN,
+    batch: CompileTime[int] = BATCH,
 ):
     h3 = 3 * hidden_dim
     n_params = h3 * input_dim + h3 * hidden_dim + h3 + h3
-    win_len = seq_len * input_dim  # 10*45 = 450 (even -> 4-byte DMA aligned)
+    win_len = batch * seq_len * input_dim  # per-batch x_window, all windows
+    latent_len = batch * hidden_dim        # per-batch latent, all windows
     dtype = np.dtype[bfloat16]
 
     win_ty = np.ndarray[(win_len,), dtype]
     params_ty = np.ndarray[(n_params,), dtype]
-    h_ty = np.ndarray[(hidden_dim,), dtype]
+    h_ty = np.ndarray[(latent_len,), dtype]
 
     kernel = _make_encoder_kernel(
         arg_types=[win_ty, params_ty, h_ty],
@@ -90,6 +96,7 @@ def gru_encoder(
             f"-DINPUT_DIM={input_dim}",
             f"-DHIDDEN_DIM={hidden_dim}",
             f"-DSEQ_LEN={seq_len}",
+            f"-DBATCH={batch}",
         ],
     )
 
@@ -127,6 +134,8 @@ def _make_argparser():
     p.add_argument("--input-dim", type=int, default=INPUT_DIM)
     p.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM)
     p.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    p.add_argument("--batch", type=int, default=BATCH,
+                   help="windows processed per kernel invocation")
     return p
 
 
@@ -135,6 +144,7 @@ def _compile_kwargs(opts):
         input_dim=opts.input_dim,
         hidden_dim=opts.hidden_dim,
         seq_len=opts.seq_len,
+        batch=opts.batch,
     )
 
 

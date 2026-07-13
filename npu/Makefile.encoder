@@ -27,6 +27,7 @@ INPUT_DIM ?= 48
 HIDDEN_DIM ?= 64
 SEQ_LEN ?= 10
 N_PARAMS ?= 21888  # 3*H*(INPUT_DIM+H)+2*3*H with INPUT_DIM=48 (padded)
+BATCH ?= 1  # windows per kernel invocation; params stay a single shared copy
 
 # Optional XRT paths for the Windows host build. On native Windows, set these
 # to your XRT clone (per buildHostWin.md), e.g.:
@@ -48,7 +49,7 @@ insts_target = build/insts.bin
 all: ${xclbin_target} ${insts_target} data
 
 # (i) Compile the @iron.jit design to xclbin + insts (WSL, no NPU needed).
-$(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${devicename} --input-dim ${INPUT_DIM} --hidden-dim ${HIDDEN_DIM} --seq-len ${SEQ_LEN}))
+$(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${devicename} --input-dim ${INPUT_DIM} --hidden-dim ${HIDDEN_DIM} --seq-len ${SEQ_LEN} --batch ${BATCH}))
 
 # jit_xclbin only lists the .py driver as a prerequisite, so edits to the
 # kernel sources would NOT trigger an xclbin rebuild. Add them explicitly.

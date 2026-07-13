@@ -2,19 +2,28 @@
 //
 // Generic batched NPU host for a 2-input / 1-output FLAIR kernel (encoder or
 // decoder). Loads the xclbin + the shared params buffer ONCE, then streams N
-// per-window inputs through the kernel, writing all outputs to one file. This
-// amortizes the (expensive) xclbin load across the whole dataset instead of
-// paying it per window like the single-shot test.cpp flow.
+// windows through the kernel BATCH at a time (one host<->device dispatch
+// processes `batch` windows, via the kernel's own internal loop over BATCH -
+// see kernels/gru_encoder.cc / gru_decoder.cc), writing all outputs to one
+// file. This amortizes both the (expensive) xclbin load AND the per-dispatch
+// launch/sync overhead across the whole dataset, instead of paying dispatch
+// overhead per window like a batch=1 loop does.
+//
+// N must be a multiple of `batch` -- the caller (run_dataset_inference.py)
+// zero-pads the window count up to a multiple of batch and truncates the
+// output back down afterward.
 //
 // bf16 buffers are moved as raw uint16 bytes (no host-side interpretation);
 // the Python orchestrator (run_dataset_inference.py) does all float math.
 //
 // Usage:
 //   batch_infer.exe <xclbin> <insts> <in1_file> <in2_file> <out_file>
-//                   <N> <in1_vol> <in2_vol> <out_vol> [kernel_name]
+//                   <N> <batch> <in1_vol> <in2_vol> <out_vol> [kernel_name]
 //     in1_file : N * in1_vol  bf16  (per-window input; e.g. x_window or h0)
 //     in2_file : in2_vol      bf16  (shared params, loaded once)
 //     out_file : N * out_vol  bf16  (per-window output; e.g. latent or hidden)
+//     in1_vol/out_vol are PER-WINDOW volumes; the device buffers are sized
+//     batch*in1_vol / batch*out_vol internally.
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
@@ -49,18 +58,28 @@ static std::vector<u16> load_u16(const std::string &path) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 10) {
+  if (argc < 11) {
     std::cerr << "usage: batch_infer <xclbin> <insts> <in1> <in2> <out> <N> "
-                 "<in1_vol> <in2_vol> <out_vol> [kernel]\n";
+                 "<batch> <in1_vol> <in2_vol> <out_vol> [kernel]\n";
     return 1;
   }
   std::string xclbin = argv[1], insts = argv[2];
   std::string in1_file = argv[3], in2_file = argv[4], out_file = argv[5];
   int N = std::stoi(argv[6]);
-  int in1_vol = std::stoi(argv[7]);
-  int in2_vol = std::stoi(argv[8]);
-  int out_vol = std::stoi(argv[9]);
-  std::string kernel_name = (argc > 10) ? argv[10] : "MLIR_AIE";
+  int batch = std::stoi(argv[7]);
+  int in1_vol = std::stoi(argv[8]);  // per-window
+  int in2_vol = std::stoi(argv[9]);  // shared params, not batch-scaled
+  int out_vol = std::stoi(argv[10]); // per-window
+  std::string kernel_name = (argc > 11) ? argv[11] : "MLIR_AIE";
+
+  if (batch <= 0 || N % batch != 0) {
+    std::cerr << "N (" << N << ") must be a positive multiple of batch ("
+              << batch << ")\n";
+    return 1;
+  }
+  int G = N / batch; // dispatch groups
+  int batch_in1_vol = batch * in1_vol;
+  int batch_out_vol = batch * out_vol;
 
   std::vector<u16> in1 = load_u16(in1_file); // N * in1_vol
   std::vector<u16> in2 = load_u16(in2_file); // in2_vol (shared params)
@@ -80,14 +99,16 @@ int main(int argc, char **argv) {
 
   // Buffers (group_ids match the 2-in/1-out kernel arg order used by
   // xrt_test_wrapper: 1=instr, 3=in1, 4=in2, 5=out, 6=ctrlpkts, 7=trace).
+  // in1/out buffers are sized for a whole BATCH of windows -- one dispatch
+  // processes `batch` windows via the kernel's internal loop over BATCH.
   auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int),
                           XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
-  auto bo_in1 = xrt::bo(device, in1_vol * sizeof(u16), XRT_BO_FLAGS_HOST_ONLY,
-                        kernel.group_id(3));
+  auto bo_in1 = xrt::bo(device, batch_in1_vol * sizeof(u16),
+                        XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
   auto bo_in2 = xrt::bo(device, in2_vol * sizeof(u16), XRT_BO_FLAGS_HOST_ONLY,
                         kernel.group_id(4));
-  auto bo_out = xrt::bo(device, out_vol * sizeof(u16), XRT_BO_FLAGS_HOST_ONLY,
-                        kernel.group_id(5));
+  auto bo_out = xrt::bo(device, batch_out_vol * sizeof(u16),
+                        XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
   auto bo_ctrl = xrt::bo(device, 8, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(6));
   auto bo_trace = xrt::bo(device, 1, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(7));
 
@@ -102,8 +123,9 @@ int main(int argc, char **argv) {
   const unsigned opcode = 3;
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  for (int i = 0; i < N; i++) {
-    memcpy(map_in1, &in1[(size_t)i * in1_vol], in1_vol * sizeof(u16));
+  for (int g = 0; g < G; g++) {
+    memcpy(map_in1, &in1[(size_t)g * batch_in1_vol],
+           batch_in1_vol * sizeof(u16));
     bo_in1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     auto run = kernel(opcode, bo_instr, instr_v.size(), bo_in1, bo_in2, bo_out,
@@ -111,17 +133,21 @@ int main(int argc, char **argv) {
     run.wait();
 
     bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    memcpy(&out[(size_t)i * out_vol], map_out, out_vol * sizeof(u16));
+    memcpy(&out[(size_t)g * batch_out_vol], map_out,
+           batch_out_vol * sizeof(u16));
 
-    if (((i + 1) % 100) == 0 || i + 1 == N)
-      std::cout << "  processed " << (i + 1) << "/" << N << " windows\r"
+    int windows_done = (g + 1) * batch;
+    if ((windows_done % 100) < batch || g + 1 == G)
+      std::cout << "  processed " << windows_done << "/" << N
+                << " windows (" << (g + 1) << "/" << G << " dispatches)\r"
                 << std::flush;
   }
   auto t1 = std::chrono::high_resolution_clock::now();
   double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                   .count() / 1000.0;
-  std::cout << "\n" << N << " windows in " << ms << " ms ("
-            << (ms * 1000.0 / N) << " us/window incl. host overhead)\n";
+  std::cout << "\n" << N << " windows in " << G << " dispatches (batch="
+            << batch << "), " << ms << " ms total (" << (ms * 1000.0 / N)
+            << " us/window incl. host overhead)\n";
 
   std::ofstream fo(out_file, std::ios::binary);
   fo.write(reinterpret_cast<const char *>(out.data()),
