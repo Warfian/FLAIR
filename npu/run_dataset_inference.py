@@ -20,14 +20,20 @@ XRT paths for the host build via --xrt-inc-dir / --xrt-lib-dir.
 Usage (from npu/):
     python3 run_dataset_inference.py --limit 990        # full sample dataset
     python3 run_dataset_inference.py --npz /path/to/other.npz --limit 0
+
+This module is also imported by webdemo/server.py (see run_npu_pipeline())
+to drive the live comparison website -- the CLI below is just a thin wrapper
+around the same function.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -43,10 +49,66 @@ OUTPUT_DIM = 21
 
 _CKPT = _REPO / "experiments" / "results" / "flair_minimal.pt"
 
+_PROGRESS_RE = re.compile(r"processed\s+(\d+)/(\d+)\s+windows")
+_TIMING_RE = re.compile(r"(\d+)\s+windows in\s+([\d.]+)\s+ms")
+
+# Type of a progress callback: (stage, windows_done, windows_total) -> None.
+# stage is one of "encoder", "decoder".
+ProgressCB = Optional[Callable[[str, int, int], None]]
+
 
 def sh(cmd: list[str], **kw) -> None:
     print("$ " + " ".join(cmd))
     subprocess.run(cmd, cwd=_HERE, check=True, **kw)
+
+
+def sh_stream(cmd: list[str], stage: str, on_progress: ProgressCB = None) -> tuple[str, Optional[float]]:
+    """Run cmd, forwarding its output line-by-line (splitting on '\\r' as well
+    as '\\n', since batch_infer.exe overwrites its progress line with '\\r').
+
+    Returns (full_captured_text, timing_ms) where timing_ms is parsed from a
+    "<N> windows in <ms> ms" line if present (None otherwise). Raises
+    CalledProcessError on nonzero exit, same as sh().
+    """
+    print("$ " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd, cwd=_HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    assert proc.stdout is not None
+    lines: list[str] = []
+    timing_ms: Optional[float] = None
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal timing_ms
+        if not buf:
+            return
+        line = "".join(buf)
+        buf.clear()
+        lines.append(line)
+        print(line)
+        m = _PROGRESS_RE.search(line)
+        if m and on_progress:
+            on_progress(stage, int(m.group(1)), int(m.group(2)))
+        m = _TIMING_RE.search(line)
+        if m:
+            timing_ms = float(m.group(2))
+
+    while True:
+        ch = proc.stdout.read(1)
+        if ch == "":
+            break
+        if ch in ("\r", "\n"):
+            flush()
+        else:
+            buf.append(ch)
+    flush()
+    ret = proc.wait()
+    text = "\n".join(lines)
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, cmd, output=text)
+    return text, timing_ms
 
 
 def sigmoid(x):
@@ -90,23 +152,9 @@ def roc_auc(scores, labels):
     return float(np.trapezoid(tpr, fpr))
 
 
-def main() -> None:
+def load_model_and_data(npz_path: str, limit: int):
     import torch
     from src.models.flair_model import FLAIRAutoencoder, FLAIRConfig
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--npz", type=str,
-                   default=str(_REPO / "data" / "processed" / "preprocessed.npz"))
-    p.add_argument("--seq-len", type=int, default=10,
-                   help="encoder AND decoder sequence length (= window size)")
-    p.add_argument("--limit", type=int, default=0,
-                   help="max windows (0 = all)")
-    p.add_argument("--xrt-inc-dir", type=str, default=None)
-    p.add_argument("--xrt-lib-dir", type=str, default=None)
-    p.add_argument("--skip-build", action="store_true",
-                   help="reuse existing xclbins + batch_infer.exe")
-    args = p.parse_args()
-    T = args.seq_len
 
     ckpt = torch.load(str(_CKPT), map_location="cpu")
     sd = ckpt["model_state_dict"]
@@ -115,15 +163,16 @@ def main() -> None:
     model.load_state_dict(sd)
     model.eval()
 
-    bundle = np.load(args.npz, allow_pickle=True)
+    bundle = np.load(npz_path, allow_pickle=True)
     X_num = bundle["X_num"].astype(np.float32)   # (N, T, 21)
     X_cat = bundle["X_cat"].astype(np.int64)     # (N, T, 3)
     y = bundle["y_seq"].astype(np.int64)
-    N = X_num.shape[0] if args.limit == 0 else min(args.limit, X_num.shape[0])
+    N = X_num.shape[0] if limit == 0 else min(limit, X_num.shape[0])
     X_num, X_cat, y = X_num[:N], X_cat[:N], y[:N]
-    print(f"Dataset: {N} windows, {int(y.sum())} anomalies, T={T}")
+    return model, sd, X_num, X_cat, y, N
 
-    # --- 1. Encoder inputs: embeddings + pad to 48 per timestep ---
+
+def prepare_encoder_inputs(sd, X_num, X_cat, N: int, T: int):
     sport_w = sd["sport_emb.weight"].numpy()
     dport_w = sd["dport_emb.weight"].numpy()
     proto_w = sd["proto_emb.weight"].numpy()
@@ -139,7 +188,6 @@ def main() -> None:
             x_windows[w, t, :INPUT_DIM] = xin  # last 3 stay 0 (pad)
     (_HERE / "all_x_windows.bin").write_bytes(x_windows.reshape(N, -1).tobytes())
 
-    # Encoder params (padded w_ih), matching gen_encoder_data.py.
     w_ih_e = sd["encoder.gru.weight_ih_l0"].numpy().astype(bfloat16)
     w_hh_e = sd["encoder.gru.weight_hh_l0"].numpy().astype(bfloat16)
     b_ih_e = sd["encoder.gru.bias_ih_l0"].numpy().astype(bfloat16)
@@ -152,8 +200,10 @@ def main() -> None:
     (_HERE / "enc_params.bin").write_bytes(enc_params.tobytes())
     n_enc_params = enc_params.size
     enc_in1_vol = T * INPUT_DIM_PADDED
+    return n_enc_params, enc_in1_vol
 
-    # Decoder GRU params.
+
+def prepare_decoder_params(sd):
     w_ih_d = sd["decoder.gru.weight_ih_l0"].numpy().astype(bfloat16)
     w_hh_d = sd["decoder.gru.weight_hh_l0"].numpy().astype(bfloat16)
     b_ih_d = sd["decoder.gru.bias_ih_l0"].numpy().astype(bfloat16)
@@ -162,33 +212,71 @@ def main() -> None:
         [w_ih_d.reshape(-1), w_hh_d.reshape(-1), b_ih_d, b_hh_d]
     ).astype(bfloat16)
     (_HERE / "dec_params.bin").write_bytes(dec_params.tobytes())
-    n_dec_params = dec_params.size
+    return dec_params.size
 
-    # --- Build xclbins + batch host (once) ---
+
+def build_designs(seq_len: int, xrt_inc_dir: Optional[str], xrt_lib_dir: Optional[str]) -> None:
     xf = []
-    if args.xrt_inc_dir:
-        xf.append(f"XRT_INC_DIR={args.xrt_inc_dir}")
-    if args.xrt_lib_dir:
-        xf.append(f"XRT_LIB_DIR={args.xrt_lib_dir}")
-    if not args.skip_build:
-        sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
-            str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
-            str(T), "--xclbin-path", "build/gru.xclbin", "--insts-path",
-            "build/insts.bin"])
-        sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim",
-            str(HIDDEN_DIM), "--seq-len", str(T), "--xclbin-path",
-            "build/decoder.xclbin", "--insts-path", "build/decoder_insts.bin"])
-        sh(["make", "-f", "Makefile.batch"] + xf)
+    if xrt_inc_dir:
+        xf.append(f"XRT_INC_DIR={xrt_inc_dir}")
+    if xrt_lib_dir:
+        xf.append(f"XRT_LIB_DIR={xrt_lib_dir}")
+    sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
+        str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
+        str(seq_len), "--xclbin-path", "build/gru.xclbin", "--insts-path",
+        "build/insts.bin"])
+    sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim",
+        str(HIDDEN_DIM), "--seq-len", str(seq_len), "--xclbin-path",
+        "build/decoder.xclbin", "--insts-path", "build/decoder_insts.bin"])
+    sh(["make", "-f", "Makefile.batch"] + xf)
+
+
+def run_npu_pipeline(
+    npz_path: str,
+    seq_len: int = 10,
+    limit: int = 990,
+    skip_build: bool = False,
+    xrt_inc_dir: Optional[str] = None,
+    xrt_lib_dir: Optional[str] = None,
+    on_progress: ProgressCB = None,
+) -> dict:
+    """Runs the full NPU pipeline (encoder pass + decoder pass + host glue)
+    over `limit` windows of `npz_path` and returns a result dict:
+
+      scores        : (N,) NPU-derived anomaly scores
+      pt_scores     : (N,) PyTorch anomaly scores (same windows)
+      labels        : (N,) ground-truth labels
+      timings       : {"encoder_ms", "decoder_ms", "npu_inference_ms",
+                        "npu_us_per_window"} -- pure streamed-inference time,
+                        i.e. excludes xclbin build + one-time load.
+      metrics       : {"npu_auc", "pt_auc", "npu_f1", "pt_f1", "corr",
+                        "mean_rel_err"}
+
+    Requires build_designs() (or an equivalent `make`) to have produced
+    build/gru.xclbin, build/decoder.xclbin and batch_infer.exe already when
+    skip_build=True -- that's the expected mode for the live web demo, so a
+    slow AIE recompile never happens on the user-facing "Run Demo" click.
+    """
+    T = seq_len
+    model, sd, X_num, X_cat, y, N = load_model_and_data(npz_path, limit)
+    print(f"Dataset: {N} windows, {int(y.sum())} anomalies, T={T}")
+
+    n_enc_params, enc_in1_vol = prepare_encoder_inputs(sd, X_num, X_cat, N, T)
+    n_dec_params = prepare_decoder_params(sd)
+
+    if not skip_build:
+        build_designs(T, xrt_inc_dir, xrt_lib_dir)
 
     ps = "powershell.exe"
 
-    # --- 2. NPU encoder pass ---
     print("\n[encoder] batched NPU pass")
-    sh([ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
-        "all_x_windows.bin", "enc_params.bin", "all_latents.bin",
-        str(N), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
+    _, encoder_ms = sh_stream(
+        [ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
+         "all_x_windows.bin", "enc_params.bin", "all_latents.bin",
+         str(N), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)],
+        stage="encoder", on_progress=on_progress,
+    )
 
-    # --- 3. latent -> h0 (host) ---
     latents = np.frombuffer((_HERE / "all_latents.bin").read_bytes(),
                             dtype=bfloat16).reshape(N, HIDDEN_DIM).astype(np.float32)
     W_lh = sd["decoder.latent_to_hidden.weight"].numpy().astype(np.float32)
@@ -196,14 +284,15 @@ def main() -> None:
     h0 = np.tanh(latents @ W_lh.T + b_lh).astype(bfloat16)  # (N, 64)
     (_HERE / "all_h0.bin").write_bytes(h0.tobytes())
 
-    # --- 4. NPU decoder pass ---
     print("\n[decoder] batched NPU pass")
-    sh([ps, "./batch_infer.exe", "build/decoder.xclbin",
-        "build/decoder_insts.bin", "all_h0.bin", "dec_params.bin",
-        "all_hidden.bin", str(N), str(HIDDEN_DIM), str(n_dec_params),
-        str(T * HIDDEN_DIM)])
+    _, decoder_ms = sh_stream(
+        [ps, "./batch_infer.exe", "build/decoder.xclbin",
+         "build/decoder_insts.bin", "all_h0.bin", "dec_params.bin",
+         "all_hidden.bin", str(N), str(HIDDEN_DIM), str(n_dec_params),
+         str(T * HIDDEN_DIM)],
+        stage="decoder", on_progress=on_progress,
+    )
 
-    # --- 5. hidden -> recon -> NPU MSE scores (host) ---
     hidden = np.frombuffer((_HERE / "all_hidden.bin").read_bytes(),
                            dtype=bfloat16).reshape(N, T, HIDDEN_DIM).astype(np.float32)
     W_out = sd["decoder.hidden_to_output.weight"].numpy().astype(np.float32)
@@ -211,7 +300,7 @@ def main() -> None:
     recon = hidden @ W_out.T + b_out                       # (N, T, 21)
     npu_scores = np.mean((recon - X_num[:, :T]) ** 2, axis=(1, 2))
 
-    # --- 6. PyTorch scores + metrics ---
+    import torch
     with torch.no_grad():
         pt_scores = model.anomaly_score(
             torch.from_numpy(X_num), torch.from_numpy(X_cat)
@@ -224,18 +313,73 @@ def main() -> None:
     corr = float(np.corrcoef(npu_scores, pt_scores)[0, 1])
     rel = np.abs(npu_scores - pt_scores) / (np.abs(pt_scores) + 1e-9)
 
+    encoder_ms = encoder_ms or 0.0
+    decoder_ms = decoder_ms or 0.0
+    total_ms = encoder_ms + decoder_ms
+
+    return {
+        "scores": npu_scores,
+        "pt_scores": pt_scores,
+        "labels": y,
+        "n_windows": N,
+        "timings": {
+            "encoder_ms": encoder_ms,
+            "decoder_ms": decoder_ms,
+            "npu_inference_ms": total_ms,
+            "npu_us_per_window": (total_ms * 1000.0 / N) if N else 0.0,
+        },
+        "metrics": {
+            "npu_auc": npu_auc,
+            "pt_auc": pt_auc,
+            "npu_f1": npu_f1,
+            "pt_f1": pt_f1,
+            "corr": corr,
+            "mean_rel_err": float(rel.mean()),
+            "median_rel_err": float(np.median(rel)),
+        },
+    }
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--npz", type=str,
+                   default=str(_REPO / "data" / "processed" / "preprocessed.npz"))
+    p.add_argument("--seq-len", type=int, default=10,
+                   help="encoder AND decoder sequence length (= window size)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="max windows (0 = all)")
+    p.add_argument("--xrt-inc-dir", type=str, default=None)
+    p.add_argument("--xrt-lib-dir", type=str, default=None)
+    p.add_argument("--skip-build", action="store_true",
+                   help="reuse existing xclbins + batch_infer.exe")
+    args = p.parse_args()
+
+    result = run_npu_pipeline(
+        npz_path=args.npz, seq_len=args.seq_len, limit=args.limit,
+        skip_build=args.skip_build, xrt_inc_dir=args.xrt_inc_dir,
+        xrt_lib_dir=args.xrt_lib_dir,
+    )
+
+    npu_scores, pt_scores, y = result["scores"], result["pt_scores"], result["labels"]
+    N = result["n_windows"]
+    m = result["metrics"]
+    t = result["timings"]
+
     print("\n" + "=" * 64)
     print(f"FLAIR on NPU vs PyTorch  ({N} windows)")
     print("=" * 64)
-    print(f"  per-window score: mean rel err {rel.mean()*100:.2f}%  "
-          f"median {np.median(rel)*100:.2f}%")
-    print(f"  score correlation (Pearson r) : {corr:.4f}")
+    print(f"  per-window score: mean rel err {m['mean_rel_err']*100:.2f}%  "
+          f"median {m['median_rel_err']*100:.2f}%")
+    print(f"  score correlation (Pearson r) : {m['corr']:.4f}")
     print("-" * 64)
-    print(f"  ROC-AUC   NPU {npu_auc:.4f}   PyTorch {pt_auc:.4f}")
-    print(f"  F1 @p99   NPU {npu_f1:.4f}   PyTorch {pt_f1:.4f}")
+    print(f"  ROC-AUC   NPU {m['npu_auc']:.4f}   PyTorch {m['pt_auc']:.4f}")
+    print(f"  F1 @p99   NPU {m['npu_f1']:.4f}   PyTorch {m['pt_f1']:.4f}")
+    print("-" * 64)
+    print(f"  NPU inference time: {t['npu_inference_ms']:.2f} ms total "
+          f"({t['npu_us_per_window']:.1f} us/window) "
+          f"[encoder {t['encoder_ms']:.2f} ms, decoder {t['decoder_ms']:.2f} ms]")
     print("=" * 64)
 
-    # Save per-window scores for plotting / the poster.
     out_csv = _HERE / "npu_vs_pytorch_scores.csv"
     with open(out_csv, "w") as f:
         f.write("window,label,npu_score,pytorch_score\n")

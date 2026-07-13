@@ -174,3 +174,61 @@ x_cat (B, T, 3)   → Embedding(Sport) ┐                      │
 - **Decoder:** GRU that expands the final latent state back to sequence length
 - **Loss:** mean squared error on numeric reconstruction (categorical features are not reconstructed)
 - **Anomaly score:** mean per-timestep MSE across all 21 numeric features, giving one scalar per window
+
+---
+
+## NPU Demo Site
+
+`webdemo/` is a small local website that runs FLAIR on the CPU (PyTorch) and
+on the Ryzen AI NPU at the same time over the sample dataset, and displays
+the speedup and accuracy side by side. It's meant to run on the machine that
+actually has the NPU attached.
+
+It's stdlib-only on the server side (`http.server` + `threading`, no Flask/
+FastAPI) so it doesn't add a new pip dependency to the pinned IRON/XRT
+toolchain environment.
+
+### One-time setup (build the NPU designs)
+
+From the WSL IRON environment, in `npu/`:
+
+```bash
+make -f Makefile.encoder
+make -f Makefile.decoder
+make -f Makefile.batch
+```
+
+This produces `build/gru.xclbin`, `build/decoder.xclbin`, and
+`batch_infer.exe` — the demo server always runs with `--skip-build` (the
+default) so a slow AIE recompile never happens on a "Run the demo" click.
+Re-run the relevant `make` command whenever a kernel `.cc` file changes.
+
+### Running the site
+
+From the WSL IRON environment (same one `run_dataset_inference.py` normally
+runs in — it needs torch, numpy, ml_dtypes, and `powershell.exe` reachable
+for the NPU-side `.exe`):
+
+```bash
+python3 webdemo/server.py --limit 200
+```
+
+Then open `http://127.0.0.1:8765` in a browser on the same machine. Each
+"Run the demo" click streams `--limit` windows through both the CPU and NPU
+pipelines concurrently and reports:
+
+- the NPU speedup multiplier (pure per-window streamed inference time, i.e.
+  excluding one-time xclbin load)
+- ROC-AUC and F1 for both, and how closely NPU scores track the CPU's
+- a few example traffic windows with both scores side by side
+
+Useful flags: `--npz` / `--seq-len` to point at a different dataset/window
+size, `--xrt-inc-dir` / `--xrt-lib-dir` if XRT isn't auto-detected, `--port`
+to change the port.
+
+### UI development without hardware
+
+`python3 webdemo/server.py --mock` fabricates plausible progress/timing/
+accuracy numbers using only the Python standard library (no torch, no NPU)
+so the frontend can be iterated on anywhere. The page shows a "demo mode"
+banner whenever mock data is being displayed.
