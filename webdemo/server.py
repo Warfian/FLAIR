@@ -95,6 +95,15 @@ def _snapshot() -> dict:
     return s
 
 
+def _json_fallback(o):
+    """json.dumps(default=...) hook: numpy scalar types (float32, int64, ...)
+    all expose .item() to convert to the equivalent native Python type."""
+    item = getattr(o, "item", None)
+    if callable(item):
+        return item()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+
 # ---------------------------------------------------------------------------
 # Mock pipelines (stdlib only) -- used for frontend development / demoing the
 # UI on a machine without the NPU/torch toolchain installed.
@@ -185,9 +194,11 @@ def _combine_results(cpu_result: dict, npu_result: dict) -> dict:
     npu_ms = npu_result["timings"]["npu_inference_ms"]
     speedup = (cpu_ms / npu_ms) if npu_ms > 0 else float("nan")
 
-    cpu_scores = list(cpu_result["scores"])
-    npu_scores = list(npu_result["scores"])
-    labels = list(npu_result["labels"])
+    # Real pipelines return numpy arrays (float32/int64 scalars aren't
+    # JSON-serializable), so cast to native Python types here.
+    cpu_scores = [float(s) for s in cpu_result["scores"]]
+    npu_scores = [float(s) for s in npu_result["scores"]]
+    labels = [int(l) for l in npu_result["labels"]]
 
     examples = []
     if len(cpu_scores) == len(npu_scores) == len(labels):
@@ -325,7 +336,11 @@ class DemoHandler(http.server.BaseHTTPRequestHandler):
         print("[http] " + (fmt % a))
 
     def _send_json(self, obj: dict, status: int = 200) -> None:
-        body = json.dumps(obj).encode("utf-8")
+        # Safety net: state/result dicts are built from real numpy pipeline
+        # output (float32/int64 scalars aren't JSON-serializable on their
+        # own). Known spots already cast explicitly; this catches anything
+        # missed instead of crashing the whole request.
+        body = json.dumps(obj, default=_json_fallback).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
