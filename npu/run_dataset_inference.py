@@ -20,12 +20,13 @@ XRT paths for the host build via --xrt-inc-dir / --xrt-lib-dir.
 Usage (from npu/):
     python3 run_dataset_inference.py --limit 990        # full sample dataset
     python3 run_dataset_inference.py --npz /path/to/other.npz --limit 0
-    python3 run_dataset_inference.py --batch 8 --limit 0  # batch windows/dispatch
+    python3 run_dataset_inference.py --batch-encoder 8 --batch-decoder 6 --limit 0
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import subprocess
 import sys
@@ -171,17 +172,22 @@ def main() -> None:
                    help="skip the CPU single-window latency comparison")
     p.add_argument("--cpu-warmup-iters", type=int, default=50)
     p.add_argument("--cpu-timed-iters", type=int, default=500)
-    p.add_argument("--batch", type=int, default=6,
-                   help="windows processed per NPU kernel dispatch (amortizes "
-                        "host<->device launch/sync overhead across `batch` "
-                        "windows instead of paying it per window). The "
-                        "decoder tile's usable buffer budget is 60256B "
+    p.add_argument("--batch-encoder", type=int, default=8,
+                   help="windows processed per encoder NPU kernel dispatch. "
+                        "Encoder's tile has more L1 headroom than the "
+                        "decoder's, so it can run a larger batch (8 "
+                        "compiled successfully on real hardware).")
+    p.add_argument("--batch-decoder", type=int, default=6,
+                   help="windows processed per decoder NPU kernel dispatch. "
+                        "The decoder tile's usable buffer budget is 60256B "
                         "(49920 params + 1408*batch) -- batch=7 fits with "
                         "only 480B margin, batch=8 overflows by 928B "
                         "(measured on real hardware). 6 leaves 1888B margin.")
     args = p.parse_args()
     T = args.seq_len
-    B = args.batch
+    B_enc = args.batch_encoder
+    B_dec = args.batch_decoder
+    B_lcm = math.lcm(B_enc, B_dec)
 
     ckpt = torch.load(str(_CKPT), map_location="cpu")
     sd = ckpt["model_state_dict"]
@@ -198,13 +204,15 @@ def main() -> None:
     X_num, X_cat, y = X_num[:N], X_cat[:N], y[:N]
     print(f"Dataset: {N} windows, {int(y.sum())} anomalies, T={T}")
 
-    # NPU kernels process B windows per dispatch (see --batch); pad the
-    # window count up to a multiple of B so every dispatch is full-sized.
-    # The extra rows are all-zero inputs; their outputs are discarded before
+    # NPU kernels process B_enc/B_dec windows per dispatch (see --batch-*);
+    # pad the window count up to a multiple of BOTH (their LCM) so the same
+    # padded window set is a whole number of dispatches for both passes. The
+    # extra rows are all-zero inputs; their outputs are discarded before
     # scoring, below.
-    N_pad = ((N + B - 1) // B) * B
+    N_pad = ((N + B_lcm - 1) // B_lcm) * B_lcm
     if N_pad != N:
-        print(f"Padding {N} -> {N_pad} windows to fill batch={B} "
+        print(f"Padding {N} -> {N_pad} windows to fill batch-encoder={B_enc} "
+              f"/ batch-decoder={B_dec} (lcm={B_lcm}) "
               f"(extra {N_pad - N} rows discarded before scoring)")
 
     # --- 1. Encoder inputs: embeddings + pad to 48 per timestep ---
@@ -257,10 +265,10 @@ def main() -> None:
     if not args.skip_build:
         sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
             str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
-            str(T), "--batch", str(B), "--xclbin-path", "build/gru.xclbin",
+            str(T), "--batch", str(B_enc), "--xclbin-path", "build/gru.xclbin",
             "--insts-path", "build/insts.bin"])
         sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim",
-            str(HIDDEN_DIM), "--seq-len", str(T), "--batch", str(B),
+            str(HIDDEN_DIM), "--seq-len", str(T), "--batch", str(B_dec),
             "--xclbin-path", "build/decoder.xclbin", "--insts-path",
             "build/decoder_insts.bin"])
         sh(["make", "-f", "Makefile.batch"] + xf)
@@ -271,7 +279,7 @@ def main() -> None:
     print("\n[encoder] batched NPU pass")
     enc_stdout = sh_capture([ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
         "all_x_windows.bin", "enc_params.bin", "all_latents.bin",
-        str(N_pad), str(B), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
+        str(N_pad), str(B_enc), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
     enc_us_per_window = parse_us_per_window(enc_stdout)
 
     # --- 3. latent -> h0 (host) ---
@@ -286,7 +294,7 @@ def main() -> None:
     print("\n[decoder] batched NPU pass")
     dec_stdout = sh_capture([ps, "./batch_infer.exe", "build/decoder.xclbin",
         "build/decoder_insts.bin", "all_h0.bin", "dec_params.bin",
-        "all_hidden.bin", str(N_pad), str(B), str(HIDDEN_DIM), str(n_dec_params),
+        "all_hidden.bin", str(N_pad), str(B_dec), str(HIDDEN_DIM), str(n_dec_params),
         str(T * HIDDEN_DIM)])
     dec_us_per_window = parse_us_per_window(dec_stdout)
 
@@ -348,7 +356,8 @@ def main() -> None:
         )
 
         print("\n" + "=" * 64)
-        print(f"NPU vs CPU inference speed  (per window, full encoder+decoder, batch={B})")
+        print(f"NPU vs CPU inference speed  (per window, full encoder+decoder, "
+              f"batch-encoder={B_enc} batch-decoder={B_dec})")
         print("=" * 64)
         if enc_us_per_window is not None and dec_us_per_window is not None:
             npu_us = enc_us_per_window + dec_us_per_window
