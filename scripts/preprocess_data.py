@@ -54,7 +54,7 @@ def read_dataset(path: str) -> pd.DataFrame:
 
 # Takes the StartTime column and makes sure it's an actual datetime type
 def to_datetime_safe(s: pd.Series) -> pd.Series:
-    if np.issubdtype(s.dtype, np.datetime64):
+    if pd.api.types.is_datetime64_any_dtype(s):
         return s
     return pd.to_datetime(s, errors="coerce")
 

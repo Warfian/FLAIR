@@ -69,7 +69,7 @@ paths:
   # Full raw dataset for the 80/10/10 split (see preprocess.split_ratios above).
   # Kept separate from `full_csv` so `--split` mode never changes the default
   # preprocessed.npz used by the small-sample live demo.
-  full_csv_split: "data/wustl_iiot_2021.csv"
+  full_csv_split: "src/data/wustl_iiot_2021.csv"
   processed_train_npz: "data/processed/preprocessed_train.npz"
   processed_eval_npz: "data/processed/preprocessed_eval.npz"
   processed_inference_npz: "data/processed/preprocessed_inference.npz"

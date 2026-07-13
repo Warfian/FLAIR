@@ -222,7 +222,7 @@ npu/dec_params.bin
 npu/*.csv
 
 # big raw dataset + its 80/10/10 split (regenerate via `python scripts/preprocess_data.py --split`)
-data/wustl_iiot_2021.csv
+src/data/wustl_iiot_2021.csv
 data/processed/preprocessed_train.npz
 data/processed/preprocessed_eval.npz
 data/processed/preprocessed_inference.npz
