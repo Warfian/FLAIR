@@ -171,10 +171,14 @@ def main() -> None:
                    help="skip the CPU single-window latency comparison")
     p.add_argument("--cpu-warmup-iters", type=int, default=50)
     p.add_argument("--cpu-timed-iters", type=int, default=500)
-    p.add_argument("--batch", type=int, default=8,
+    p.add_argument("--batch", type=int, default=6,
                    help="windows processed per NPU kernel dispatch (amortizes "
                         "host<->device launch/sync overhead across `batch` "
-                        "windows instead of paying it per window)")
+                        "windows instead of paying it per window). The "
+                        "decoder tile's usable buffer budget is 60256B "
+                        "(49920 params + 1408*batch) -- batch=7 fits with "
+                        "only 480B margin, batch=8 overflows by 928B "
+                        "(measured on real hardware). 6 leaves 1888B margin.")
     args = p.parse_args()
     T = args.seq_len
     B = args.batch
