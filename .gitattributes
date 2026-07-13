@@ -1,0 +1,6 @@
+# npu/ is built and run entirely through the WSL/Linux mlir-aie toolchain
+# (aiecc, make, bash scripts). Force LF regardless of either machine's local
+# core.autocrlf, so shell scripts don't get checked out with CRLF on a WSL
+# clone (which breaks bash: "$'\r': command not found") and Makefiles/kernel
+# sources stay consistent across the Windows-editing / WSL-building split.
+npu/** text eol=lf
