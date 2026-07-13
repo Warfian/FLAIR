@@ -1,0 +1,53 @@
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
+include ${srcdir}/../../makefile-common
+
+targetname = gru_decoder
+aie_py_src = gru_decoder.py
+devicename = npu
+
+HIDDEN_DIM ?= 64
+SEQ_LEN ?= 10
+N_PARAMS ?= 24960
+WINDOW_INDEX ?= 0
+
+XRT_FLAGS =
+ifdef XRT_INC_DIR
+XRT_FLAGS += -DXRT_INC_DIR=`${getwslpath} ${XRT_INC_DIR}`
+endif
+ifdef XRT_LIB_DIR
+XRT_FLAGS += -DXRT_LIB_DIR=`${getwslpath} ${XRT_LIB_DIR}`
+endif
+
+xclbin_target = build/decoder.xclbin
+insts_target = build/decoder_insts.bin
+
+.PHONY: all
+all: ${xclbin_target} ${insts_target} data
+
+$(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},--dev ${devicename} --hidden-dim ${HIDDEN_DIM} --seq-len ${SEQ_LEN}))
+
+${xclbin_target} ${insts_target}: ${srcdir}/kernels/gru_decoder.cc ${srcdir}/kernels/gru_common.h
+
+$(eval $(call build_host_exe,${targetname},_build,test_decoder.cpp,${XRT_FLAGS} -DNPU_MODE=decoder -DINPUT_DIM=${HIDDEN_DIM} -DHIDDEN_DIM=${HIDDEN_DIM} -DSEQ_LEN=${SEQ_LEN} -DN_PARAMS=${N_PARAMS}))
+
+.PHONY: data
+data:
+	python3 ${srcdir}/gen_decoder_data.py --seq-len ${SEQ_LEN} --window-index ${WINDOW_INDEX}
+
+.PHONY: run
+run: ${targetname}.exe ${xclbin_target} ${insts_target} data
+	${powershell} ./$< -x ${xclbin_target} -i ${insts_target} -k MLIR_AIE -v 1
+
+# End-to-end anomaly score: run hidden_to_output + MSE on the NPU hidden_seq
+# (dumped by test_decoder.cpp) and compare to the PyTorch-precision reference.
+.PHONY: score
+score:
+	python3 ${srcdir}/compare_anomaly_score.py --seq-len ${SEQ_LEN} --window-index ${WINDOW_INDEX}
+
+.PHONY: clean
+clean:
+	rm -rf build _build ${targetname}*.exe \
+	decoder_h0.bin decoder_gru_params.bin decoder_hidden_golden.bin \
+	decoder_latent.bin decoder_params.bin decoder_x_num.bin \
+	decoder_golden_recon.bin decoder_golden_score.bin decoder_npu_hidden.bin
