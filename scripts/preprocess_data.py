@@ -309,10 +309,30 @@ def main_split(config_path: str = "config.yaml") -> None:
 
     y_row = work[label_col].astype(int).to_numpy(dtype=np.int64)
 
-    # Vocabs from the full dataset so category IDs are consistent across splits.
-    sport_vocab = build_vocab(work["Sport"])
-    dport_vocab = build_vocab(work["Dport"])
-    proto_vocab = build_vocab(work["Proto"])
+    vocab_ref_path = paths_cfg.get("vocab_reference_npz", "")
+    X_num_raw = work[NUMERIC_FEATURES].to_numpy(dtype=np.float32)
+    M = len(work)
+    (tr_start, tr_end), (ev_start, ev_end), (inf_start, inf_end) = chronological_split_ranges(M, ratios)
+    print(f"[preprocess-split] rows: train={tr_end - tr_start}  eval={ev_end - ev_start}  "
+          f"inference={inf_end - inf_start}")
+
+    if vocab_ref_path:
+        # Reuse an existing checkpoint's vocab + normalization so category IDs
+        # and numeric scaling match what that checkpoint was trained on.
+        print(f"[preprocess-split] Reusing vocab/mu/sigma from: {vocab_ref_path}")
+        ref = np.load(vocab_ref_path, allow_pickle=True)
+        sport_vocab = ref["sport_vocab"][0]
+        dport_vocab = ref["dport_vocab"][0]
+        proto_vocab = ref["proto_vocab"][0]
+        mu = ref["mu"].astype(np.float32)
+        sigma = ref["sigma"].astype(np.float32)
+    else:
+        # Fresh vocab + normalization fit from this dataset's own TRAIN split
+        # (use this when training a new model on the big dataset).
+        sport_vocab = build_vocab(work["Sport"])
+        dport_vocab = build_vocab(work["Dport"])
+        proto_vocab = build_vocab(work["Proto"])
+        _, mu, sigma = zscore_normalize_numeric(X_num_raw[tr_start:tr_end], y_row[tr_start:tr_end])
 
     X_cat = np.stack([
         encode_with_vocab(work["Sport"], sport_vocab),
@@ -320,15 +340,6 @@ def main_split(config_path: str = "config.yaml") -> None:
         encode_with_vocab(work["Proto"], proto_vocab),
     ], axis=1).astype(np.int64)
 
-    X_num_raw = work[NUMERIC_FEATURES].to_numpy(dtype=np.float32)
-
-    M = len(work)
-    (tr_start, tr_end), (ev_start, ev_end), (inf_start, inf_end) = chronological_split_ranges(M, ratios)
-    print(f"[preprocess-split] rows: train={tr_end - tr_start}  eval={ev_end - ev_start}  "
-          f"inference={inf_end - inf_start}")
-
-    # Normalize using TRAIN-split normal rows only; apply the same mu/sigma to all splits.
-    _, mu, sigma = zscore_normalize_numeric(X_num_raw[tr_start:tr_end], y_row[tr_start:tr_end])
     X_num = ((X_num_raw - mu) / sigma).astype(np.float32)
 
     splits = {

@@ -70,6 +70,14 @@ paths:
   # Kept separate from `full_csv` so `--split` mode never changes the default
   # preprocessed.npz used by the small-sample live demo.
   full_csv_split: "src/data/wustl_iiot_2021.csv"
+
+  # If set, --split mode reuses this bundle's sport/dport/proto vocab and
+  # mu/sigma instead of fitting fresh ones from full_csv_split. Required when
+  # scoring the big dataset with an existing checkpoint (e.g. flair_minimal.pt)
+  # so category IDs and numeric scaling match what that checkpoint was trained
+  # on. Leave blank ("") to fit fresh stats (e.g. when training a new model on
+  # the big dataset instead).
+  vocab_reference_npz: "data/processed/preprocessed.npz"
   processed_train_npz: "data/processed/preprocessed_train.npz"
   processed_eval_npz: "data/processed/preprocessed_eval.npz"
   processed_inference_npz: "data/processed/preprocessed_inference.npz"

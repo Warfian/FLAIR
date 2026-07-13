@@ -35,7 +35,7 @@ from src.models.flair_model import FLAIRAutoencoder, FLAIRConfig  # noqa: E402
 HIDDEN_DIM = 64
 OUTPUT_DIM = 21
 
-_CKPT = _REPO / "experiments" / "results" / "flair_80_10_10.pt"
+_CKPT = _REPO / "experiments" / "results" / "flair_minimal.pt"
 _NPZ = _REPO / "data" / "processed" / "preprocessed.npz"
 
 

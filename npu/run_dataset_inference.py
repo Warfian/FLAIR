@@ -43,7 +43,7 @@ INPUT_DIM_PADDED = 48
 HIDDEN_DIM = 64
 OUTPUT_DIM = 21
 
-_CKPT = _REPO / "experiments" / "results" / "flair_80_10_10.pt"
+_CKPT = _REPO / "experiments" / "results" / "flair_minimal.pt"
 
 
 def sh(cmd: list[str], **kw) -> None:
