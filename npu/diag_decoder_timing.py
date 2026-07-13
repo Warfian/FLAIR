@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -97,6 +98,15 @@ def main() -> None:
     ps = "powershell.exe"
 
     if not args.skip_build:
+        # ALWAYS delete every .prj dir before rebuilding. IRON/aiecc's own
+        # ExternalFunction build cache does not reliably invalidate on
+        # changes to included headers like gru_common.h (source_string is
+        # just two fixed #include lines, unaffected by what's inside them --
+        # see flair-npu-iron-kernel-gotchas memory item 10). Without this, a
+        # kernel edit can silently test stale, unchanged compiled code and
+        # report a false "no change" result.
+        for prj in ("decoder", "decoder_final", "decoder_noop", "decoder_matvec_only"):
+            shutil.rmtree(_HERE / "build" / f"{prj}.prj", ignore_errors=True)
         sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim", str(H),
             "--seq-len", str(T), "--batch", str(B), "--xclbin-path",
             "build/decoder.xclbin", "--insts-path", "build/decoder_insts.bin"])
