@@ -163,6 +163,62 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
   }
 }
 
+// Variant of gru_step for callers whose x_in is CONSTANT across the whole
+// timestep loop (e.g. the decoder: x_t = h0_vec on every step, since it has
+// no autoregressive/categorical feedback into the recurrence -- see
+// decoder.py's "repeated input" design). gi = w_ih @ x_in + b_ih is then
+// invariant too, so the caller computes it ONCE (via matvec_bias) before the
+// loop and passes it here each timestep, instead of gru_step recomputing it
+// from x_in on every call. Only gh = w_hh @ h + b_hh (which genuinely
+// changes as h evolves) is recomputed. Same gate-combine math as gru_step.
+//
+// `gi` MUST be 32-byte aligned (vector-loaded) and H3=3*HIDDEN_DIM long.
+// `h` MUST be 32-byte aligned and HIDDEN_DIM long, same as gru_step.
+inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
+                             const bfloat16 *restrict w_hh,
+                             const bfloat16 *restrict b_hh) {
+  constexpr int H = HIDDEN_DIM;
+  constexpr int H3 = 3 * H;
+
+  alignas(aie::vector_decl_align) bfloat16 gh[H3];
+  alignas(aie::vector_decl_align) bfloat16 h_prev[H];
+
+  matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses old h
+  for (int i = 0; i < H; i++)
+    h_prev[i] = h[i];
+
+  const bfloat16 *gi_r = gi, *gi_z = gi + H, *gi_n = gi + 2 * H;
+  const bfloat16 *gh_r = gh, *gh_z = gh + H, *gh_n = gh + 2 * H;
+
+  AIE_LOOP_MIN_ITERATION_COUNT(H / 16)
+  for (int i = 0; i < H; i += 16) {
+    aie::vector<bfloat16, 16> vgi_r = aie::load_v<16>(gi_r + i);
+    aie::vector<bfloat16, 16> vgh_r = aie::load_v<16>(gh_r + i);
+    aie::vector<bfloat16, 16> pre_r = aie::add(vgi_r, vgh_r);
+    aie::vector<bfloat16, 16> r = sigmoid16(pre_r);
+
+    aie::vector<bfloat16, 16> vgi_z = aie::load_v<16>(gi_z + i);
+    aie::vector<bfloat16, 16> vgh_z = aie::load_v<16>(gh_z + i);
+    aie::vector<bfloat16, 16> pre_z = aie::add(vgi_z, vgh_z);
+    aie::vector<bfloat16, 16> z = sigmoid16(pre_z);
+
+    aie::vector<bfloat16, 16> vgi_n = aie::load_v<16>(gi_n + i);
+    aie::vector<bfloat16, 16> vgh_n = aie::load_v<16>(gh_n + i);
+    aie::vector<bfloat16, 16> r_gh_n = aie::mul(r, vgh_n);
+    aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
+    aie::vector<bfloat16, 16> n = tanh16(n_pre);
+
+    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
+    aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+    aie::vector<bfloat16, 16> one_minus_z = aie::sub(one, z);
+    aie::vector<bfloat16, 16> term1 = aie::mul(one_minus_z, n);
+    aie::vector<bfloat16, 16> term2 = aie::mul(z, vh_prev);
+    aie::vector<bfloat16, 16> h_out = aie::add(term1, term2);
+
+    aie::store_v(h + i, h_out); // overwrite h with the new hidden state
+  }
+}
+
 } // namespace flair
 
 #endif // FLAIR_GRU_COMMON_H

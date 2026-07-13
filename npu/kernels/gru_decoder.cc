@@ -72,19 +72,16 @@ extern "C" void gru_decoder_bf16(
             h[i] = h0_vec_b[i];
         }
 
+        // Decoder input x_t = h0_vec_b is IDENTICAL on every timestep (no
+        // autoregressive/categorical feedback), so gi = w_ih @ h0_vec_b +
+        // b_ih is invariant too -- compute it ONCE instead of every
+        // timestep (gru_step would otherwise redo this same matvec 10x).
+        alignas(aie::vector_decl_align) bfloat16 gi[H3];
+        flair::matvec_bias(w_ih, h0_vec_b, b_ih, gi, H3, INPUT_DIM);
+
         // Full decoder GRU sequence.
         for (int t = 0; t < SEQ_LEN; t++) {
-            // Decoder input is repeated every timestep:
-            // x_t = h0_vec_b
-            flair::gru_step(
-                h0_vec_b,
-                h,
-                w_ih,
-                w_hh,
-                b_ih,
-                b_hh,
-                INPUT_DIM
-            );
+            flair::gru_step_with_gi(gi, h, w_hh, b_hh);
 
             // Save h_t into hidden_seq_b[t].
             for (int i = 0; i < H; i++) {
@@ -182,8 +179,12 @@ extern "C" void gru_decoder_final_bf16(
             h[i] = h0_vec_b[i];
         }
 
+        // Same gi-hoisting as gru_decoder_bf16 -- see that function's comment.
+        alignas(aie::vector_decl_align) bfloat16 gi[H3];
+        flair::matvec_bias(w_ih, h0_vec_b, b_ih, gi, H3, INPUT_DIM);
+
         for (int t = 0; t < SEQ_LEN; t++) {
-            flair::gru_step(h0_vec_b, h, w_ih, w_hh, b_ih, b_hh, INPUT_DIM);
+            flair::gru_step_with_gi(gi, h, w_hh, b_hh);
         }
 
         // Write ONLY the final hidden state (batch*H total).
