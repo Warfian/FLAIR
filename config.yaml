@@ -55,11 +55,32 @@ preprocess:
   dropna: true                    # drop rows with missing feature values
   # optional: if StartTime is a string, we will parse it in code
 
+  # 80/10/10 train/eval/inference split of paths.full_csv_split, used by
+  # `python scripts/preprocess_data.py --split`. Chronological (time-sorted)
+  # so each window's rows stay within a single split.
+  split_ratios: [0.8, 0.1, 0.1]
+
 paths:
   # For now, point to your sample file so we can test the pipeline.
   # Later you will point this to the full giant CSV on the training machine.
   sample_xlsx: "src/data/DATASET_Sample_1000.xlsx"
   # full_csv: "PATH/TO/YOUR/GIANT.csv"
+
+  # Full raw dataset for the 80/10/10 split (see preprocess.split_ratios above).
+  # Kept separate from `full_csv` so `--split` mode never changes the default
+  # preprocessed.npz used by the small-sample live demo.
+  full_csv_split: "src/data/wustl_iiot_2021.csv"
+
+  # If set, --split mode reuses this bundle's sport/dport/proto vocab and
+  # mu/sigma instead of fitting fresh ones from full_csv_split. Required when
+  # scoring the big dataset with an existing checkpoint (e.g. flair_minimal.pt)
+  # so category IDs and numeric scaling match what that checkpoint was trained
+  # on. Leave blank ("") to fit fresh stats (e.g. when training a new model on
+  # the big dataset instead).
+  vocab_reference_npz: "data/processed/preprocessed.npz"
+  processed_train_npz: "data/processed/preprocessed_train.npz"
+  processed_eval_npz: "data/processed/preprocessed_eval.npz"
+  processed_inference_npz: "data/processed/preprocessed_inference.npz"
 
   processed_sequences_npy: "data/processed/sequences.npy"
   processed_seq_labels_npy: "data/processed/seq_labels.npy"

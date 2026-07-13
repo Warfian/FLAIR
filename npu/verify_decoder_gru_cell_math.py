@@ -136,7 +136,7 @@ def main() -> None:
     print(f"model cfg: {cfg}")
 
     model = FLAIRAutoencoder(cfg)
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)  # checkpoint may include unused cat-loss heads
     model.eval()
 
     x_num = torch.tensor(data["X_num"][WINDOW_INDEX : WINDOW_INDEX + 1], dtype=torch.float32)

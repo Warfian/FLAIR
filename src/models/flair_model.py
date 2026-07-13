@@ -46,6 +46,11 @@ class FLAIRConfig:
     dropout: float = 0.0
     bidirectional: bool = False
 
+    # Weight for an auxiliary categorical-reconstruction loss term used by some
+    # training runs (see decoder sport_head/dport_head/proto_head). Not used by
+    # forward()/anomaly_score() here, which remain numeric-reconstruction-only.
+    cat_loss_weight: float = 0.0
+
 
 class FLAIRAutoencoder(nn.Module):
     def __init__(self, cfg: FLAIRConfig):
