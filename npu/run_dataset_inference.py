@@ -9,8 +9,9 @@ Pipeline (two batched NPU passes with numpy glue in between):
   1. host : embeddings + pad -> all_x_windows.bin           (N x SEQ*48 bf16)
   2. NPU  : batch_infer.exe (encoder xclbin, loaded once)   -> all_latents.bin
   3. host : latent -> h0 = tanh(latent_to_hidden(latent))   -> all_h0.bin
-  4. NPU  : batch_infer.exe (decoder xclbin, loaded once)   -> all_hidden.bin
-  5. host : hidden_to_output -> MSE -> NPU anomaly scores
+  4. NPU  : batch_infer.exe (fused decoder xclbin, loaded   -> all_recon.bin
+            once; hidden_to_output computed on-core)
+  5. host : MSE(recon, x_num) -> NPU anomaly scores
   6. host : PyTorch scores + threshold -> F1 / ROC-AUC for both, compared
 
 Requires: the WSL IRON env sourced (incl. XRT setup.sh so xclbinutil is on
@@ -20,7 +21,7 @@ XRT paths for the host build via --xrt-inc-dir / --xrt-lib-dir.
 Usage (from npu/):
     python3 run_dataset_inference.py --limit 990        # full sample dataset
     python3 run_dataset_inference.py --npz /path/to/other.npz --limit 0
-    python3 run_dataset_inference.py --batch-encoder 8 --batch-decoder 6 --limit 0
+    python3 run_dataset_inference.py --batch-encoder 8 --batch-decoder 10 --limit 0
 """
 
 from __future__ import annotations
@@ -177,12 +178,18 @@ def main() -> None:
                         "Encoder's tile has more L1 headroom than the "
                         "decoder's, so it can run a larger batch (8 "
                         "compiled successfully on real hardware).")
-    p.add_argument("--batch-decoder", type=int, default=6,
+    p.add_argument("--batch-decoder", type=int, default=10,
                    help="windows processed per decoder NPU kernel dispatch. "
-                        "The decoder tile's usable buffer budget is 60256B "
-                        "(49920 params + 1408*batch) -- batch=7 fits with "
-                        "only 480B margin, batch=8 overflows by 928B "
-                        "(measured on real hardware). 6 leaves 1888B margin.")
+                        "Now built against the fused decoder (hidden_to_output "
+                        "computed on-core -> 420B/window output instead of "
+                        "1280B/window), which shrinks the per-window growth "
+                        "from 1408B to 548B. Estimated budget (60256B, "
+                        "calibrated from the unfused kernel's measured "
+                        "overflow -- not yet confirmed for this kernel): "
+                        "52650 + 548*batch <= 60256 -> batch<=13 in theory. "
+                        "10 leaves ~2100B margin as a first, untested attempt; "
+                        "dial down if the build overflows, or try 12-13 for "
+                        "more speed once 10 is confirmed working.")
     args = p.parse_args()
     T = args.seq_len
     B_enc = args.batch_encoder
@@ -245,13 +252,18 @@ def main() -> None:
     n_enc_params = enc_params.size
     enc_in1_vol = T * INPUT_DIM_PADDED
 
-    # Decoder GRU params.
+    # Decoder GRU params + fused hidden_to_output weights:
+    # [w_ih | w_hh | b_ih | b_hh | w_out | b_out] -- matches
+    # gru_decoder_fused_bf16's params layout in kernels/gru_decoder.cc.
     w_ih_d = sd["decoder.gru.weight_ih_l0"].numpy().astype(bfloat16)
     w_hh_d = sd["decoder.gru.weight_hh_l0"].numpy().astype(bfloat16)
     b_ih_d = sd["decoder.gru.bias_ih_l0"].numpy().astype(bfloat16)
     b_hh_d = sd["decoder.gru.bias_hh_l0"].numpy().astype(bfloat16)
+    w_out_d = sd["decoder.hidden_to_output.weight"].numpy().astype(bfloat16)
+    b_out_d = sd["decoder.hidden_to_output.bias"].numpy().astype(bfloat16)
     dec_params = np.concatenate(
-        [w_ih_d.reshape(-1), w_hh_d.reshape(-1), b_ih_d, b_hh_d]
+        [w_ih_d.reshape(-1), w_hh_d.reshape(-1), b_ih_d, b_hh_d,
+         w_out_d.reshape(-1), b_out_d]
     ).astype(bfloat16)
     (_HERE / "dec_params.bin").write_bytes(dec_params.tobytes())
     n_dec_params = dec_params.size
@@ -267,10 +279,10 @@ def main() -> None:
             str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
             str(T), "--batch", str(B_enc), "--xclbin-path", "build/gru.xclbin",
             "--insts-path", "build/insts.bin"])
-        sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim",
-            str(HIDDEN_DIM), "--seq-len", str(T), "--batch", str(B_dec),
-            "--xclbin-path", "build/decoder.xclbin", "--insts-path",
-            "build/decoder_insts.bin"])
+        sh(["python3", "gru_decoder_fused.py", "--dev", "npu", "--hidden-dim",
+            str(HIDDEN_DIM), "--seq-len", str(T), "--output-dim", str(OUTPUT_DIM),
+            "--batch", str(B_dec), "--xclbin-path", "build/decoder_fused.xclbin",
+            "--insts-path", "build/decoder_fused_insts.bin"])
         sh(["make", "-f", "Makefile.batch"] + xf)
 
     ps = "powershell.exe"
@@ -290,21 +302,19 @@ def main() -> None:
     h0 = np.tanh(latents @ W_lh.T + b_lh).astype(bfloat16)  # (N_pad, 64)
     (_HERE / "all_h0.bin").write_bytes(h0.tobytes())
 
-    # --- 4. NPU decoder pass ---
-    print("\n[decoder] batched NPU pass")
-    dec_stdout = sh_capture([ps, "./batch_infer.exe", "build/decoder.xclbin",
-        "build/decoder_insts.bin", "all_h0.bin", "dec_params.bin",
-        "all_hidden.bin", str(N_pad), str(B_dec), str(HIDDEN_DIM), str(n_dec_params),
-        str(T * HIDDEN_DIM)])
+    # --- 4. NPU decoder pass (hidden_to_output fused on-core) ---
+    print("\n[decoder] batched NPU pass (fused hidden_to_output)")
+    dec_stdout = sh_capture([ps, "./batch_infer.exe", "build/decoder_fused.xclbin",
+        "build/decoder_fused_insts.bin", "all_h0.bin", "dec_params.bin",
+        "all_recon.bin", str(N_pad), str(B_dec), str(HIDDEN_DIM), str(n_dec_params),
+        str(T * OUTPUT_DIM)])
     dec_us_per_window = parse_us_per_window(dec_stdout)
 
-    # --- 5. hidden -> recon -> NPU MSE scores (host) ---
-    # Discard the N_pad-N padding rows now, before scoring.
-    hidden = np.frombuffer((_HERE / "all_hidden.bin").read_bytes(),
-                           dtype=bfloat16).reshape(N_pad, T, HIDDEN_DIM).astype(np.float32)[:N]
-    W_out = sd["decoder.hidden_to_output.weight"].numpy().astype(np.float32)
-    b_out = sd["decoder.hidden_to_output.bias"].numpy().astype(np.float32)
-    recon = hidden @ W_out.T + b_out                       # (N, T, 21)
+    # --- 5. NPU MSE scores (host) ---
+    # recon comes straight from the NPU now (hidden_to_output is fused into
+    # the decoder kernel). Discard the N_pad-N padding rows before scoring.
+    recon = np.frombuffer((_HERE / "all_recon.bin").read_bytes(),
+                          dtype=bfloat16).reshape(N_pad, T, OUTPUT_DIM).astype(np.float32)[:N]
     npu_scores = np.mean((recon - X_num[:, :T]) ** 2, axis=(1, 2))
 
     # --- 6. PyTorch scores + metrics ---
