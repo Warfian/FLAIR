@@ -74,24 +74,25 @@ extern "C" void gru_decoder_bf16(
 
         // Decoder input x_t = h0_vec_b is IDENTICAL on every timestep (no
         // autoregressive/categorical feedback), so gi = w_ih @ h0_vec_b + b_ih
-        // is invariant. The obvious optimisation is to hoist that matvec out of
-        // the loop and call gru_step_with_gi -- and that is what this used to
-        // do. It is NOT used, deliberately:
+        // is invariant. Compute it ONCE here, then reuse it every timestep via
+        // gru_step_with_gi (which recomputes only gh = w_hh @ h). This avoids
+        // redoing the w_ih matvec 10x/window -- roughly a 2x decoder speedup.
         //
-        // Hoisting keeps a gi[H3] array (384B) live in THIS frame across the
-        // whole timestep loop, ON TOP of gru_step_with_gi's own gh[H3]. With the
-        // vectorized polynomial nonlinearity that combination reliably produced
-        // NaN in the decoder while the encoder -- same gate loop, same
-        // sigmoid16/tanh16, but no caller-held gi -- stayed clean. Calling
-        // gru_step instead gives the decoder the byte-for-byte same frame layout
-        // as the encoder, the one configuration that demonstrably works.
-        //
-        // Cost: gi is recomputed each timestep (10x this matvec per window)
-        // rather than once. That is exactly what the encoder already does every
-        // step, so the decoder simply lands near encoder speed. Correctness over
-        // a ~2x decoder-side saving; revisit only with a hardware-verified fix.
+        // This hoist was previously DISABLED because it NaN'd: the caller-held
+        // gi[H3] (384B) lived across the loop on top of gru_step_with_gi's then
+        // gh[H3]+h_prev[H] (512B) AND the heavier vectorized-polynomial
+        // nonlinearity's registers -- ~1KB+, overflowing the core stack. Both
+        // causes are now gone: h_prev was removed from the step functions, and
+        // the nonlinearity is the lean Newton-refined sigmoid. Peak frame is now
+        // gi(384)+h(128)+gh(384) = 896B, byte-for-byte the same as the encoder's
+        // gru_step path (gi+gh 768 + caller h 128), which works. Pure speed
+        // change -- identical math to the gru_step path, so no accuracy risk;
+        // if hardware ever regresses, revert to `gru_step(h0_vec_b, ...)`.
+        alignas(aie::vector_decl_align) bfloat16 gi[H3];
+        flair::matvec_bias(w_ih, h0_vec_b, b_ih, gi, H3, INPUT_DIM);
+
         for (int t = 0; t < SEQ_LEN; t++) {
-            flair::gru_step(h0_vec_b, h, w_ih, w_hh, b_ih, b_hh, INPUT_DIM);
+            flair::gru_step_with_gi(gi, h, w_hh, b_hh);
 
             // Save h_t into hidden_seq_b[t].
             for (int i = 0; i < H; i++) {
