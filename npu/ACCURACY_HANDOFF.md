@@ -361,6 +361,40 @@ python3 run_dataset_inference.py --npz ../data/processed/retrain_test.npz \
         --skip-build --skip-cpu-baseline
 ```
 
+### NPU precision floor on the GOOD model — and the clip lever
+Running the retrained hidden=64 model on the NPU (thesis-style test set) gave
+NPU F1=0.894 vs PyTorch 0.936 (ROC-AUC 0.992 vs 0.999). This is NOT the toy
+result (where NPU≡PyTorch) — because the good model reconstructs normal traffic
+so well (scores ~0.1) that the NPU's numerical error becomes significant.
+
+Diagnosed from the per-window scores CSV:
+- The NPU error is **input-magnitude-dependent**, not a constant floor:
+  corr(NPU−PyTorch score, mean|z|) = 0.70 on normal windows. bf16 has fixed
+  ~0.4% *relative* precision, so *absolute* error grows with activation
+  magnitude and compounds through the 10-step recurrence.
+- Attacks (large scores) are barely affected. The damage is a heavy right tail
+  on ~2% of NORMAL windows (those with peak|z|≈9), which inflates the normal-p99
+  threshold 0.103→0.626 (6×) and thereby misses 676 mild attacks (PyTorch score
+  0.1–0.6). No global additive/multiplicative correction recovers it (tested) —
+  it is added variance, not offset; even label-informed best-F1 caps NPU at 0.899.
+
+**Lever (validated PyTorch-side, pending NPU confirmation):** clip tighter.
+Since the noise scales with |z|, capping |z| at 6 instead of 10 shrinks exactly
+the activations driving the error. Retrained at clip=6, PyTorch cost is
+negligible (F1 0.9418→0.9399, ROC-AUC unchanged) — so it should lower the NPU
+threshold and recover recall at almost no accuracy cost. Checkpoint committed:
+`experiments/results/flair_h64_clip6.pt`. To test on the NPU:
+```
+# set preprocess.clip_zscore: 6.0 in config.yaml, then:
+python scripts/preprocess_data.py --split-eval          # regen retrain_test.npz at clip=6
+python3 run_dataset_inference.py --npz ../data/processed/retrain_test.npz \
+        --ckpt ../experiments/results/flair_h64_clip6.pt --skip-build --skip-cpu-baseline
+# MUST use the clip=6 npz with the clip=6 ckpt (train/inference clip must match).
+```
+If confirmed, clip=6 (or a swept optimum) becomes the NPU-deployment default.
+The deeper fix is higher-precision LUT nonlinearity (Problem B proper), but the
+clip lever is far cheaper if it lands.
+
 ### Remaining / optional
 - Held-out generalization metric: needs a split where held-out data contains
   anomalies (current chronological split is train-only for anomalies). Change
