@@ -13,9 +13,13 @@
 // Key learned constraints (see the FLAIR NPU memory / commit history):
 //  * aie::mul/add/sub of two bf16 vectors return an aie::accum, not a vector;
 //    materialize each into an explicit vector before feeding the next op.
-//  * Nonlinearities are built from the EXP LUT (getExpBf16, truncate policy,
-//    never NaN), NOT getTanhBf16 (which had a deterministic NaN on an
-//    interior input).
+//    Chaining them (e.g. aie::mul(aie::add(a,b), c)) silently yields wrong
+//    values in EVERY lane -- the tell is an all-dimensions mismatch.
+//  * Nonlinearities are a Pade[7/6] rational tanh evaluated in scalar fp32,
+//    with sigmoid derived as 0.5*(1+tanh(x/2)) -- see the block above them.
+//    Do NOT use getTanhBf16 (deterministic NaN on an interior input). The old
+//    exp-LUT sigmoid (getExpBf16 + raw getInvBf16) was NaN-free but only ~8-9%
+//    accurate, which was the entire NPU accuracy loss; it is gone.
 //  * aie::load_v<16>/store_v need 32-byte-aligned pointers; copy any buffer
 //    reached at a non-vector-aligned offset into an aligned local first.
 //
@@ -34,33 +38,108 @@ static_assert(HIDDEN_DIM % 16 == 0,
 
 namespace flair {
 
-// sigmoid(x) = 1 / (1 + exp(-x)). exp via getExpBf16 (vector, robust);
-// reciprocal per-lane via getInvBf16 (scalar bit-manipulation, no LUT range).
-inline aie::vector<bfloat16, 16>
-sigmoid16(const aie::vector<bfloat16, 16> &x) {
-  aie::vector<bfloat16, 16> zero = aie::broadcast<bfloat16, 16>(0.0f);
-  aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
-  aie::vector<bfloat16, 16> neg_x = aie::sub(zero, x);              // -x
-  aie::vector<bfloat16, 16> e = to_v16bfloat16(getExpBf16(neg_x));  // exp(-x)
-  aie::vector<bfloat16, 16> denom = aie::add(one, e);              // 1 + exp(-x)
+// ---------------------------------------------------------------------------
+// Nonlinearities: Pade[7/6] rational tanh, with sigmoid derived from it.
+//
+// REPLACES the old exp-LUT path (getExpBf16 + a raw getInvBf16 reciprocal).
+// That path was only ~8-9% accurate, and it was the ENTIRE NPU accuracy loss:
+// it inflated the normal-p99 detection threshold 6x and cost ~4 F1 points
+// (NPU 0.894 vs PyTorch 0.936). Crucially, bf16 rounding itself costs NOTHING
+// (1.00x inflation, F1 identical to PyTorch) -- so the nonlinearity was the
+// whole error budget. See npu/precision_ablation.py, which reproduces all of
+// this without hardware.
+//
+// Validated in numpy over 2e6 points on [-30, 30]:
+//   * max |err| vs true tanh = 6.6e-4   (3.3e-3 after bf16 rounding, vs ~8-9%
+//     for the old LUT -- a ~25x improvement, well inside the <4% needed)
+//   * den >= 1 ALWAYS  -> the reciprocal is always finite -> CANNOT emit NaN
+//   * |tanh| <= 0.999344 < 1 -> gate math stays bounded, GRU stays stable
+//   * end-to-end pipeline sim: threshold inflation 6.06x -> 1.01x, F1 -> 0.938
+//
+// THREE deliberate choices below. Each avoids a failure mode that has ALREADY
+// been hit on this kernel -- please do not "simplify" them away:
+//
+//  1. THE +-4 CLAMP IS MANDATORY. The Pade rational does NOT saturate: its
+//     leading terms give num/den -> 0.0357*x as |x| -> inf, so an UNCLAMPED
+//     evaluation returns |tanh| > 1 on large gate pre-activations and
+//     destabilises the recurrence. tanh(4)=0.99933, so clamping costs < 7e-4.
+//
+//  2. SCALAR fp32 PER-LANE, *not* chained aie:: vector ops. Per the notes at the
+//     top of this file, aie::mul/add/sub on bf16 vectors return an aie::accum,
+//     NOT a vector. A chained rational expression like aie::mul(aie::add(a,b),c)
+//     silently produces WRONG VALUES IN EVERY LANE -- that is exactly the
+//     "all 64 latent dims mismatch" symptom a previous Pade attempt hit. Doing
+//     the polynomial in scalar fp32 sidesteps the accum/vector trap completely,
+//     and also keeps the ~0.4%-per-op bf16 rounding out of the polynomial. Only
+//     store_v/load_v are used here -- the same idioms the old sigmoid16 used.
+//
+//  3. RECIPROCAL = getInvBf16 SEED + 2 NEWTON STEPS, not a bare '/'. Newton
+//     needs only multiply/subtract (certainly available) and squares the
+//     relative error each step, so the result is accurate even though the raw
+//     getInvBf16 seed is coarse -- and that coarse seed is itself a prime
+//     suspect for the old path's error. (Plain `num / den` is equivalent if the
+//     toolchain provides scalar fp32 divide; this form simply does not depend
+//     on that.)
+//
+// STACK: each function uses ONE 16-element bf16 scratch array (32 B) -- FEWER
+// than the old sigmoid16's two (64 B). Core-stack pressure goes DOWN, not up,
+// so this does not bring back the ~1KB-stack corruption NaN.
+// ---------------------------------------------------------------------------
 
-  alignas(aie::vector_decl_align) bfloat16 denom_arr[16];
-  alignas(aie::vector_decl_align) bfloat16 out_arr[16];
-  aie::store_v(denom_arr, denom);
-  for (int j = 0; j < 16; j++)
-    out_arr[j] = getInvBf16((float)denom_arr[j]);                  // 1 / denom
-  return aie::load_v<16>(out_arr);
+// Pade[7/6] tanh coefficients, normalised by 135135 so every intermediate stays
+// O(1). (The textbook form has coefficients up to 135135 and x^6 terms, which
+// would burn bf16 exponent range for no benefit.)
+//   tanh(x) ~ x*(1 + a1 x^2 + a2 x^4 + a3 x^6) / (1 + b1 x^2 + b2 x^4 + b3 x^6)
+static constexpr float kPadeA1 = 0.1282051282f; // 17325/135135
+static constexpr float kPadeA2 = 0.0027972028f; //   378/135135
+static constexpr float kPadeA3 = 7.4000740e-6f; //     1/135135
+static constexpr float kPadeB1 = 0.4615384615f; // 62370/135135
+static constexpr float kPadeB2 = 0.0233100233f; //  3150/135135
+static constexpr float kPadeB3 = 2.0720207e-4f; //    28/135135
+static constexpr float kPadeClamp = 4.0f;
+
+// 1/d for d >= 1. Coarse seed + 2 Newton-Raphson steps: r <- r*(2 - d*r).
+// The relative error squares each step, so even a poor seed converges. Callers
+// guarantee d >= 1, so this can never divide by zero and never returns NaN.
+static inline float flair_recip(float d) {
+  float r = (float)getInvBf16(d);
+  r = r * (2.0f - d * r);
+  r = r * (2.0f - d * r);
+  return r;
 }
 
-// tanh(x) = 2*sigmoid(2x) - 1.
+// Pade tanh for a single lane, evaluated in fp32.
+static inline float flair_tanh_f32(float v) {
+  if (v > kPadeClamp)
+    v = kPadeClamp; // MANDATORY: the Pade does not saturate (see note 1)
+  else if (v < -kPadeClamp)
+    v = -kPadeClamp;
+  const float v2 = v * v;
+  const float num = v * (1.0f + v2 * (kPadeA1 + v2 * (kPadeA2 + v2 * kPadeA3)));
+  const float den = 1.0f + v2 * (kPadeB1 + v2 * (kPadeB2 + v2 * kPadeB3));
+  return num * flair_recip(den); // den >= 1 -> always finite, |result| < 1
+}
+
+// tanh(x), bf16 in / bf16 out.
 inline aie::vector<bfloat16, 16>
 tanh16(const aie::vector<bfloat16, 16> &x) {
-  aie::vector<bfloat16, 16> two = aie::broadcast<bfloat16, 16>(2.0f);
-  aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
-  aie::vector<bfloat16, 16> two_x = aie::mul(x, two);
-  aie::vector<bfloat16, 16> s = sigmoid16(two_x);
-  aie::vector<bfloat16, 16> two_s = aie::mul(two, s);
-  return aie::sub(two_s, one);
+  alignas(aie::vector_decl_align) bfloat16 a[16];
+  aie::store_v(a, x);
+  for (int j = 0; j < 16; j++)
+    a[j] = (bfloat16)flair_tanh_f32((float)a[j]);
+  return aie::load_v<16>(a);
+}
+
+// sigmoid(x) = 0.5 * (1 + tanh(x/2)). Derived from the tanh above, so the kernel
+// contains exactly ONE approximation to validate -- no exp LUT, no raw
+// reciprocal. Bounded in (0, 1) by construction.
+inline aie::vector<bfloat16, 16>
+sigmoid16(const aie::vector<bfloat16, 16> &x) {
+  alignas(aie::vector_decl_align) bfloat16 a[16];
+  aie::store_v(a, x);
+  for (int j = 0; j < 16; j++)
+    a[j] = (bfloat16)(0.5f * (1.0f + flair_tanh_f32(0.5f * (float)a[j])));
+  return aie::load_v<16>(a);
 }
 
 // out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]. bf16 in/out, fp32

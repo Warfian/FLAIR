@@ -409,16 +409,41 @@ source toggled. Decisive result (hidden=64 model, thesis-style test set):
 - **Target: get nonlinearity relative error under ~4%** → inflation ≤1.2x and F1
   returns to ~0.937 (i.e. full PyTorch parity, recovering 0.894 → 0.937).
 
-**Recommended fix (Problem B, the only remaining lever):** replace
-`sigmoid16`/`tanh16` in `gru_common.h` with a more accurate vectorized
-approximation. The previously-abandoned **Padé[7/6] tanh (numpy-validated ~6e-4
-error, unbiased)** is ~100x more accurate than the ~4% needed — it was dropped
-for compiler/stack reasons, not accuracy. Any decent polynomial/rational
-sigmoid+tanh that stays in vector registers (no large scalar stack arrays — see
-§6 stack-overflow NaN) will do. This is the whole ballgame; nothing else moves
-the needle.
+#### FIX IMPLEMENTED (needs a rebuild + NPU run to confirm)
+`gru_common.h` now uses a **Padé[7/6] rational tanh**, with
+`sigmoid(x) = 0.5*(1 + tanh(x/2))` derived from it — the exp-LUT path
+(`getExpBf16` + raw `getInvBf16`) is gone. Simulated end-to-end this restores
+**inflation 6.06x → 1.01x, recall 0.911 → 0.992, F1 0.894 → 0.938** (PyTorch is
+0.936), i.e. the entire gap closes.
 
-Reproduce/verify the analysis (no NPU needed):
+A previous Padé attempt failed with "mismatch on all 64 latent dims". Three
+choices in the new code prevent that — **do not simplify them away**:
+1. **The ±4 clamp is mandatory.** The Padé does NOT saturate (num/den → 0.0357·x
+   as |x|→∞), so unclamped it returns |tanh| > 1 and destabilises the GRU.
+2. **Scalar fp32 per-lane, not chained `aie::` vector ops.** `aie::mul/add/sub`
+   on bf16 vectors return an `aie::accum`, not a vector; a chained rational
+   expression silently gives wrong values in EVERY lane — precisely the
+   all-dims-mismatch symptom. Only `store_v`/`load_v` are used.
+3. **Reciprocal = `getInvBf16` seed + 2 Newton steps**, not a bare `/`. Uses only
+   mul/sub, and squares the relative error each step, so it is accurate even if
+   the seed is coarse.
+
+Validated before building (`g++ -O2 -Wall` on the exact scalar math, with a
+deliberately 25%-error reciprocal seed, swept over [-40,40] + extremes to 1e30):
+max err tanh 0.58% / sigmoid 0.39%; |tanh| ≤ 0.996 < 1 (0 violations);
+0 non-finite (den ≥ 1 always ⇒ NaN is impossible). Stack went DOWN (one 16-elem
+scratch array vs the old two).
+
+⚠️ **`rm -rf build/gru.prj build/decoder.prj` before rebuilding** — the IRON
+build cache does not invalidate on `gru_common.h` edits (§5), so a stale build
+will silently test the OLD nonlinearity.
+
+Caveat: this is more scalar work per lane than the LUT, so expect the kernel to
+be **slower**. Accuracy was the goal here (speed is out of scope per §1); if it
+matters, the polynomial can be vectorized later — but only by materialising every
+`aie::` op into an explicit named vector (see failure mode 2).
+
+Reproduce the analysis (no NPU needed):
 ```
 python npu/precision_ablation.py --limit 40000
 ```
