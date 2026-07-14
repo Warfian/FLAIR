@@ -211,18 +211,18 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
-  // STATIC (L1/BSS), NOT the stack. These are 768B and the AIE core stack is
-  // only ~1KB: 768B of gi/gh plus the scalar gate loop's fp32 temporaries
-  // overflow it, which corrupts memory and yields garbage/NaN latents. That is
-  // a CORRUPTION NaN, not an arithmetic one -- the tell is that it moves with
-  // code layout (see ACCURACY_HANDOFF.md Sec 6, and scalar_probe.cc, which
-  // isolated exactly this).
+  // NOT static. Making these static (to save stack) is WRONG and actively
+  // corrupts results: gru_encoder.cc's BATCH loop runs independent windows, so
+  // the compiler may software-pipeline/overlap those iterations, and overlapping
+  // bodies would clobber shared static scratch. The observed signature was
+  // exactly that -- garbage/diverged latents whose failure rate rose
+  // monotonically with the slot index within the batch (slot 0: 1/30 ...
+  // slot 7: 8/30). Timesteps are serial; batch iterations are NOT.
   //
-  // Safe to share across calls: timesteps are strictly serial (step t+1 needs h
-  // from step t) and batch items run one after another, so two gru_step bodies
-  // can never overlap. matvec_bias rewrites all H3 rows of gi/gh every call.
-  alignas(aie::vector_decl_align) static bfloat16 gi[H3];
-  alignas(aie::vector_decl_align) static bfloat16 gh[H3];
+  // Stack cost is fine: 768B here, LESS than the original kernel's 896B (it also
+  // carried h_prev[64], which gru_gate_combine no longer needs).
+  alignas(aie::vector_decl_align) bfloat16 gi[H3];
+  alignas(aie::vector_decl_align) bfloat16 gh[H3];
 
   matvec_bias(w_ih, x_in, b_ih, gi, H3, input_dim);
   matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
@@ -248,10 +248,10 @@ inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
-  // STATIC (L1/BSS), not the stack -- same core-stack reasoning as gru_step
-  // above (384B here). This is this function's own static, distinct from
-  // gru_step's.
-  alignas(aie::vector_decl_align) static bfloat16 gh[H3];
+  // NOT static -- see gru_step: the decoder's batch loop is likewise a set of
+  // independent iterations the compiler may overlap, and shared static scratch
+  // would be clobbered across them. 384B on the stack is fine.
+  alignas(aie::vector_decl_align) bfloat16 gh[H3];
 
   matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
                                          // before gru_gate_combine touches h
