@@ -262,11 +262,32 @@ max score at ~27 (was 1.2e11). clip=5 over-clips (AUC drops to 0.986); 20/40
 are finite but less accurate. Regenerated splits now report `max|z| = 10` and
 PyTorch scores are finite (range 0.002–16.5 on inference).
 
-### STILL TO DO — validate on real NPU hardware
-This work was done on an Intel box with **no NPU / no XRT / no WSL**, so the
-on-hardware "NaN gone" confirmation is NOT yet done. To validate on the AMD
-7940HS+NPU machine (prebuilt binaries are in `Code/xcl/`: `batch_infer.exe`,
-`gru.xclbin`+`insts.bin`, `decoder.xclbin`+`decoder_insts.bin`):
+### CONFIRMED ON REAL NPU HARDWARE (AMD 7940HS)
+Both problems are now validated on-device with the clamped path:
+
+- **Problem A (NaN): FIXED.** Full 119,437-window inference split ran to
+  completion, **all scores finite**, no "invalid value" warning (was 100% nan
+  before). `Pearson r = 0.9642` vs PyTorch. ROC-AUC/F1 = nan/0 there only
+  because that split has 0 anomalies (both paths identical).
+- **Problem B (drift): NON-ISSUE for detection**, exactly as predicted by the
+  per-path-calibration approach. On a balanced 20,000-window TRAIN subset
+  (`--sample 20000`, 2703 anomalies), with each path self-calibrated to its own
+  normal-p99 threshold, NPU and PyTorch flag the **identical** windows:
+
+  ```
+            thr      TP   FP    TN   FN   Prec    Rec     F1     FPR
+  NPU     3.45778   2390  173 17124  313 0.9325 0.8842 0.9077 0.0100
+  PyTorch 3.58067   2390  173 17124  313 0.9325 0.8842 0.9077 0.0100
+  ```
+  `r = 0.9991`, ROC-AUC 0.9935 (NPU) vs 0.9943 (PyTorch). Only the threshold
+  differs (bf16 scores on a slightly different scale); calibration absorbs it.
+  CAVEAT: this subset is from TRAIN (seen in training), so F1=0.9077 is a
+  fidelity/parity number, not a held-out generalization estimate — the current
+  chronological split has no held-out anomalies to give the latter.
+
+The commands that produced the above (reproduce with prebuilt binaries in
+`Code/xcl/`: `batch_infer.exe`, `gru.xclbin`+`insts.bin`,
+`decoder.xclbin`+`decoder_insts.bin`):
 
 ```
 # 1. regenerate the CLAMPED split with the committed config (clip_zscore: 10.0)
@@ -274,8 +295,11 @@ python scripts/preprocess_data.py --split
 # 2. stage prebuilt binaries into npu/ and npu/build/ (batch_infer.exe + 4 build files)
 # 3. from npu/, run the full split reusing the prebuilt xclbins (no WSL build):
 python3 run_dataset_inference.py --npz ../data/processed/preprocessed_inference.npz \
-        --limit 0 --skip-build --skip-cpu-baseline
-# EXPECT: no "invalid value" warning, finite NPU scores, Pearson r ~1.0 vs PyTorch.
+        --limit 0 --skip-build --skip-cpu-baseline        # NaN-gone check (all-normal)
+# Labeled detection metrics (balanced subset from TRAIN, which has the anomalies;
+# a --limit prefix would be all-normal since train anomalies start ~window 223k):
+python3 run_dataset_inference.py --npz ../data/processed/preprocessed_train.npz \
+        --sample 20000 --skip-build --skip-cpu-baseline
 # To reproduce the ORIGINAL NaN first, set clip_zscore: null, re-run step 1, run step 3.
 ```
 
@@ -294,7 +318,21 @@ time-ordered split puts **all 128,581 anomaly windows in TRAIN**; eval and
 inference are both 0-anomaly. So ROC-AUC/F1 must be measured on a TRAIN subset
 (as done above), or the split methodology changed, not on eval.
 
-### Problem B (soft drift) — not yet addressed
-Untouched. Note clamping should *reduce* drift too (smaller inputs → less
-bf16 error to compound), but the actual NPU-vs-PyTorch drift number needs the
-hardware run above to measure.
+### Problem B (soft drift) — RESOLVED as a detection non-issue
+The ~13–22% per-window rel err is real but does NOT harm detection: with each
+path calibrated to its own normal-p99 threshold, NPU and PyTorch produce the
+identical confusion matrix on the 20k labeled subset (see the hardware result
+above). So do not chase the rel-err number — it is expected from bf16/LUT and
+is absorbed by per-path threshold calibration. `run_dataset_inference.py` now
+prints these calibrated metrics and labels rel-err "INFO ONLY".
+
+### Remaining / optional
+- Held-out generalization metric: needs a split where held-out data contains
+  anomalies (current chronological split is train-only for anomalies). Change
+  `preprocess.split_ratios` / split strategy if a clean eval-set F1 is wanted.
+- Threshold is path-specific: the clamped path's normal-p99 (~3.46 NPU on the
+  20k subset) differs from the old unclamped `3.189216`. Re-derive per final
+  execution path (unfused vs fused/batched decoder); never carry a locked
+  threshold across paths.
+- In-kernel `sigmoid16` clamp backstop still optional (see above); not needed
+  while inputs are clamped to |z|≤10.
