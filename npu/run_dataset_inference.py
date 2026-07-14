@@ -140,6 +140,26 @@ def f1_at_percentile(scores, labels, pct=99.0):
     return f1, thr
 
 
+def detection_metrics(scores, labels, pct=99.0):
+    """Full per-path detection breakdown at a NORMAL-only pth-percentile
+    threshold. Each path (NPU vs PyTorch) is calibrated on its OWN score
+    distribution -- NPU bf16/LUT scores are on a slightly different scale than
+    PyTorch fp32, so a shared/absolute threshold is misleading; the calibrated
+    detection metrics are what should be compared. Returns a dict."""
+    thr = float(np.percentile(scores[labels == 0], pct))
+    pred = (scores > thr).astype(np.int64)
+    tp = int(((labels == 1) & (pred == 1)).sum())
+    fp = int(((labels == 0) & (pred == 1)).sum())
+    tn = int(((labels == 0) & (pred == 0)).sum())
+    fn = int(((labels == 1) & (pred == 0)).sum())
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) else 0.0
+    return dict(thr=thr, tp=tp, fp=fp, tn=tn, fn=fn,
+                prec=prec, rec=rec, f1=f1, fpr=fpr)
+
+
 def roc_auc(scores, labels):
     order = np.argsort(-scores)
     y = labels[order]
@@ -165,6 +185,15 @@ def main() -> None:
                    help="encoder AND decoder sequence length (= window size)")
     p.add_argument("--limit", type=int, default=0,
                    help="max windows (0 = all)")
+    p.add_argument("--sample", type=int, default=0,
+                   help="if >0, randomly sample this many windows (after "
+                        "--limit) with a fixed seed. Use for a BALANCED labeled "
+                        "subset: the train split's anomalies are chronologically "
+                        "clustered (none before window ~223k), so a --limit "
+                        "prefix is all-normal and yields undefined ROC-AUC; a "
+                        "random --sample of train gives ~13.5%% anomalies.")
+    p.add_argument("--sample-seed", type=int, default=0,
+                   help="RNG seed for --sample (reproducible subset).")
     p.add_argument("--xrt-inc-dir", type=str, default=None)
     p.add_argument("--xrt-lib-dir", type=str, default=None)
     p.add_argument("--skip-build", action="store_true",
@@ -205,6 +234,12 @@ def main() -> None:
     y = bundle["y_seq"].astype(np.int64)
     N = X_num.shape[0] if args.limit == 0 else min(args.limit, X_num.shape[0])
     X_num, X_cat, y = X_num[:N], X_cat[:N], y[:N]
+    if args.sample and args.sample < N:
+        rng = np.random.default_rng(args.sample_seed)
+        sel = np.sort(rng.choice(N, size=args.sample, replace=False))
+        X_num, X_cat, y = X_num[sel], X_cat[sel], y[sel]
+        N = args.sample
+        print(f"Sampled {N} windows (seed={args.sample_seed}) from the split")
     print(f"Dataset: {N} windows, {int(y.sum())} anomalies, T={T}")
 
     # NPU kernels process B_enc/B_dec windows per dispatch (see --batch-*);
@@ -326,22 +361,38 @@ def main() -> None:
             torch.from_numpy(X_num), torch.from_numpy(X_cat)
         ).numpy()
 
-    npu_f1, _ = f1_at_percentile(npu_scores, y)
-    pt_f1, _ = f1_at_percentile(pt_scores, y)
     npu_auc = roc_auc(npu_scores, y)
     pt_auc = roc_auc(pt_scores, y)
     corr = float(np.corrcoef(npu_scores, pt_scores)[0, 1])
     rel = np.abs(npu_scores - pt_scores) / (np.abs(pt_scores) + 1e-9)
+    n_anom = int(y.sum())
 
     print("\n" + "=" * 64)
-    print(f"FLAIR on NPU vs PyTorch  ({N} windows)")
+    print(f"FLAIR on NPU vs PyTorch  ({N} windows, {n_anom} anomalies)")
     print("=" * 64)
-    print(f"  per-window score: mean rel err {rel.mean()*100:.2f}%  "
-          f"median {np.median(rel)*100:.2f}%")
     print(f"  score correlation (Pearson r) : {corr:.4f}")
+    print(f"  per-window rel err (INFO ONLY): mean {rel.mean()*100:.2f}%  "
+          f"median {np.median(rel)*100:.2f}%")
+    print("  (NPU bf16/LUT scores are on a different scale than PyTorch fp32;")
+    print("   rel err is expected to be nonzero. Judge detection by the")
+    print("   per-path calibrated metrics below, not by score identity.)")
     print("-" * 64)
-    print(f"  ROC-AUC   NPU {npu_auc:.4f}   PyTorch {pt_auc:.4f}")
-    print(f"  F1 @p99   NPU {npu_f1:.4f}   PyTorch {pt_f1:.4f}")
+    if n_anom == 0:
+        print("  No anomalies in this window set -> ROC-AUC / F1 undefined.")
+        print("  (eval & inference splits are all-normal; use --sample on the")
+        print("   train split for a labeled subset, e.g. --npz ...train.npz")
+        print("   --sample 20000.)")
+    else:
+        nm = detection_metrics(npu_scores, y)
+        pm = detection_metrics(pt_scores, y)
+        print(f"  ROC-AUC     NPU {npu_auc:.4f}     PyTorch {pt_auc:.4f}")
+        print("  Detection @ normal-p99 threshold (each path self-calibrated):")
+        print(f"    {'':10s} {'thr':>10s} {'TP':>5s} {'FP':>4s} {'TN':>6s} "
+              f"{'FN':>4s} {'Prec':>7s} {'Rec':>7s} {'F1':>7s} {'FPR':>7s}")
+        for tag, m in (("NPU", nm), ("PyTorch", pm)):
+            print(f"    {tag:10s} {m['thr']:>10.5f} {m['tp']:>5d} {m['fp']:>4d} "
+                  f"{m['tn']:>6d} {m['fn']:>4d} {m['prec']:>7.4f} {m['rec']:>7.4f} "
+                  f"{m['f1']:>7.4f} {m['fpr']:>7.4f}")
     print("=" * 64)
 
     # Save per-window scores for plotting / the poster.
