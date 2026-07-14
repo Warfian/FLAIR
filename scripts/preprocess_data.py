@@ -397,8 +397,134 @@ def main_split(config_path: str = "config.yaml") -> None:
     print(f"[preprocess-split] Proto vocab size: {len(proto_vocab) + 1} (including UNK)")
 
 
+def main_split_eval(config_path: str = "config.yaml") -> None:
+    """Thesis-style evaluation split (Dumond FLAIR thesis Sec 3.6).
+
+    Unlike main_split (pure chronological, which leaves the test partitions
+    all-normal), this builds a labeled TEST set: train/val are NORMAL windows
+    only (chronological), and the test set is the newest normal windows PLUS
+    attack windows sampled to the natural attack rate. Attacks are excluded from
+    train/val regardless of temporal position. mu/sigma are fit FRESH on the
+    train-period normal rows (not reused from the sample), giving a self-
+    consistent bundle for retraining an NPU-sized (hidden=64) model.
+    """
+    cfg = load_config(config_path)
+    CATEGORICAL_FEATURES: List[str] = cfg["features"]["categorical"]
+    NUMERIC_FEATURES: List[str] = cfg["features"]["numeric"]
+    time_col = cfg["data"]["time_column"]
+    label_col = cfg["data"]["label_column"]
+    window_size = int(cfg["preprocess"]["window_size"])
+    stride = int(cfg["preprocess"].get("stride", 1))
+    sort_time = bool(cfg["preprocess"].get("sort_time", True))
+    dropna = bool(cfg["preprocess"].get("dropna", True))
+
+    es = cfg["preprocess"].get("eval_split", {})
+    n_ratios = es.get("normal_ratios", [0.8, 0.1, 0.1])
+    attack_rate = float(es.get("test_attack_rate", 0.0728))
+    train_max = int(es.get("train_max_windows", 0))
+    seed = int(es.get("seed", 42))
+
+    paths_cfg = cfg.get("paths", {})
+    input_path = paths_cfg.get("full_csv_split") or paths_cfg.get("full_csv")
+    out_tr = paths_cfg.get("evalsplit_train_npz", "data/processed/retrain_train.npz")
+    out_va = paths_cfg.get("evalsplit_val_npz", "data/processed/retrain_val.npz")
+    out_te = paths_cfg.get("evalsplit_test_npz", "data/processed/retrain_test.npz")
+    for p in (out_tr, out_va, out_te):
+        ensure_parent_dir(p)
+
+    print(f"[split-eval] Reading dataset: {input_path}")
+    df = read_dataset(input_path)
+    required = [time_col, label_col] + NUMERIC_FEATURES + CATEGORICAL_FEATURES
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+    work = df[required].copy()
+    work[time_col] = to_datetime_safe(work[time_col])
+    if dropna:
+        work = work.dropna(subset=[time_col, label_col] + NUMERIC_FEATURES).copy()
+    if sort_time:
+        work = work.sort_values(by=time_col).reset_index(drop=True)
+
+    y_row = work[label_col].astype(int).to_numpy(dtype=np.int64)
+    M = len(work)
+
+    # Vocab from all rows (label-agnostic); mu/sigma FRESH from train-period
+    # normal rows only (the model trains on older, normal traffic).
+    sport_vocab = build_vocab(work["Sport"])
+    dport_vocab = build_vocab(work["Dport"])
+    proto_vocab = build_vocab(work["Proto"])
+    X_cat = np.stack([
+        encode_with_vocab(work["Sport"], sport_vocab),
+        encode_with_vocab(work["Dport"], dport_vocab),
+        encode_with_vocab(work["Proto"], proto_vocab),
+    ], axis=1).astype(np.int64)
+
+    X_num_raw = work[NUMERIC_FEATURES].to_numpy(dtype=np.float32)
+    train_row_end = int(round(M * n_ratios[0]))
+    tr_normal_rows = (y_row[:train_row_end] == 0)
+    mu = X_num_raw[:train_row_end][tr_normal_rows].mean(axis=0).astype(np.float32)
+    sigma = X_num_raw[:train_row_end][tr_normal_rows].std(axis=0).astype(np.float32)
+    sigma = np.where(sigma < 1e-8, 1.0, sigma).astype(np.float32)
+    X_num = ((X_num_raw - mu) / sigma).astype(np.float32)
+    clip = get_clip_value(cfg)
+    X_num = clip_zscore(X_num, clip)
+    print(f"[split-eval] fit mu/sigma on {int(tr_normal_rows.sum())} train-normal rows; "
+          f"clip_zscore={clip}  post-clip max|z|={np.abs(X_num).max():.4g}")
+
+    # Window the whole chronological sequence once.
+    Xn_win, Xc_win, y_seq = build_sliding_windows(
+        X_num=X_num, X_cat=X_cat, y_row=y_row,
+        window_size=window_size, stride=stride)
+    Nw = len(y_seq)
+    normal_idx = np.where(y_seq == 0)[0]        # chronological order preserved
+    attack_idx = np.where(y_seq == 1)[0]
+    print(f"[split-eval] windows: {Nw} total, {len(normal_idx)} normal, "
+          f"{len(attack_idx)} attack")
+
+    # Split NORMAL windows chronologically into train/val/test-normal.
+    n_norm = len(normal_idx)
+    a = int(round(n_norm * n_ratios[0]))
+    b = int(round(n_norm * (n_ratios[0] + n_ratios[1])))
+    tr_idx = normal_idx[:a]
+    va_idx = normal_idx[a:b]
+    te_norm_idx = normal_idx[b:]
+
+    rng = np.random.default_rng(seed)
+    # Cap training windows for CPU tractability (stride-1 windows are redundant).
+    if train_max and len(tr_idx) > train_max:
+        tr_idx = np.sort(rng.choice(tr_idx, size=train_max, replace=False))
+        print(f"[split-eval] subsampled train to {train_max} normal windows")
+
+    # Sample attack windows so the test set hits the target attack rate.
+    n_te_norm = len(te_norm_idx)
+    n_attack = int(round(attack_rate / (1.0 - attack_rate) * n_te_norm))
+    n_attack = min(n_attack, len(attack_idx))
+    att_sample = rng.choice(attack_idx, size=n_attack, replace=False)
+    te_idx = np.sort(np.concatenate([te_norm_idx, att_sample]))
+    print(f"[split-eval] test set: {n_te_norm} normal + {n_attack} attack "
+          f"= {len(te_idx)} windows ({100*n_attack/len(te_idx):.2f}% attack)")
+
+    meta = dict(
+        mu=mu, sigma=sigma,
+        num_features=np.array(NUMERIC_FEATURES, dtype=object),
+        cat_features=np.array(CATEGORICAL_FEATURES, dtype=object),
+        sport_vocab=np.array([sport_vocab], dtype=object),
+        dport_vocab=np.array([dport_vocab], dtype=object),
+        proto_vocab=np.array([proto_vocab], dtype=object),
+    )
+    for name, idx, out_path in (("train", tr_idx, out_tr),
+                                ("val", va_idx, out_va),
+                                ("test", te_idx, out_te)):
+        np.savez(out_path, X_num=Xn_win[idx], X_cat=Xc_win[idx],
+                 y_seq=y_seq[idx], **meta)
+        print(f"[split-eval] {name}: {out_path}  X_num={Xn_win[idx].shape}  "
+              f"attacks={int(y_seq[idx].sum())}/{len(idx)}")
+
+
 if __name__ == "__main__":
-    if "--split" in sys.argv:
+    if "--split-eval" in sys.argv:
+        main_split_eval()
+    elif "--split" in sys.argv:
         main_split()
     else:
         main()

@@ -226,3 +226,8 @@ src/data/wustl_iiot_2021.csv
 data/processed/preprocessed_train.npz
 data/processed/preprocessed_eval.npz
 data/processed/preprocessed_inference.npz
+
+# thesis-style eval split bundles (regenerate via preprocess_data.py --split-eval)
+data/processed/retrain_train.npz
+data/processed/retrain_val.npz
+data/processed/retrain_test.npz

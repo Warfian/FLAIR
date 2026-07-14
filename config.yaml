@@ -71,6 +71,22 @@ preprocess:
   # so each window's rows stay within a single split.
   split_ratios: [0.8, 0.1, 0.1]
 
+  # Thesis-style evaluation split (`python scripts/preprocess_data.py
+  # --split-eval`), following Dumond's FLAIR thesis Sec 3.6: train/val are
+  # NORMAL windows only (chronological, older->newer); the test set is the
+  # newest normal windows PLUS attack windows SAMPLED to the natural attack
+  # rate (attacks are excluded from train/val regardless of temporal position,
+  # because a pure chronological slice under-samples rare attack types). mu/sigma
+  # are fit fresh on the train-period normal rows (NOT reused from the sample),
+  # so this produces a self-consistent bundle for retraining an NPU-sized model.
+  eval_split:
+    normal_ratios: [0.8, 0.1, 0.1]   # train/val/test split of NORMAL windows
+    test_attack_rate: 0.0728          # target attack fraction of the test set
+    train_max_windows: 200000         # cap train windows for CPU tractability
+                                       # (stride-1 windows are 90% redundant);
+                                       # 0 = use all
+    seed: 42
+
 paths:
   # For now, point to your sample file so we can test the pipeline.
   # Later you will point this to the full giant CSV on the training machine.
@@ -92,6 +108,11 @@ paths:
   processed_train_npz: "data/processed/preprocessed_train.npz"
   processed_eval_npz: "data/processed/preprocessed_eval.npz"
   processed_inference_npz: "data/processed/preprocessed_inference.npz"
+
+  # Thesis-style eval split outputs (see preprocess.eval_split).
+  evalsplit_train_npz: "data/processed/retrain_train.npz"
+  evalsplit_val_npz: "data/processed/retrain_val.npz"
+  evalsplit_test_npz: "data/processed/retrain_test.npz"
 
   processed_sequences_npy: "data/processed/sequences.npy"
   processed_seq_labels_npy: "data/processed/seq_labels.npy"
