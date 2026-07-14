@@ -13,13 +13,9 @@
 // Key learned constraints (see the FLAIR NPU memory / commit history):
 //  * aie::mul/add/sub of two bf16 vectors return an aie::accum, not a vector;
 //    materialize each into an explicit vector before feeding the next op.
-//  * Nonlinearities are a minimax polynomial tanh on the VECTOR unit, with
-//    sigmoid = 0.5*(1+tanh(x/2)) -- see the block below. Do NOT use
-//    getTanhBf16 (deterministic NaN on an interior input). Do NOT evaluate them
-//    in scalar fp32: two attempts did, and both DIVERGED on hardware.
-//  * The scalar fp32 path on this core is not trustworthy. Note matvec_bias
-//    always takes its VECTORIZED branch here (cols 48 and 64 are both %16==0),
-//    so its scalar fallback never actually runs.
+//  * Nonlinearities are built from the EXP LUT (getExpBf16, truncate policy,
+//    never NaN), NOT getTanhBf16 (which had a deterministic NaN on an
+//    interior input).
 //  * aie::load_v<16>/store_v need 32-byte-aligned pointers; copy any buffer
 //    reached at a non-vector-aligned offset into an aligned local first.
 //
@@ -38,102 +34,74 @@ static_assert(HIDDEN_DIM % 16 == 0,
 
 namespace flair {
 
-// ---------------------------------------------------------------------------
-// Nonlinearities: minimax polynomial tanh evaluated ENTIRELY ON THE VECTOR
-// UNIT, with sigmoid derived as 0.5*(1 + tanh(x/2)).
+// sigmoid(x) = 1 / (1 + exp(-x)).
 //
-// WHY NOT THE EXP LUT: the old getExpBf16 + getInvBf16 sigmoid is NaN-free but
-// only ~8-9% accurate, and that error is the whole NPU accuracy loss -- it
-// inflates the normal-p99 detection threshold ~6x and costs ~4 F1 points
-// (NPU 0.894 vs PyTorch 0.936). bf16 rounding itself costs nothing. See
-// npu/precision_ablation.py, which reproduces this without hardware.
+// exp comes from getExpBf16 (a real vector LUT). The RECIPROCAL is where this
+// kernel used to lose all its accuracy: getInvBf16 is a bit-manipulation
+// reciprocal (the classic magic-constant trick), accurate to only ~5-8% without
+// refinement. Because sigmoid's relative error IS the reciprocal's relative
+// error, that one function plausibly accounts for the entire ~8-9% nonlinearity
+// error -- which inflates the normal-p99 detection threshold ~6x and costs ~4 F1
+// points on hardware (NPU 0.894 vs PyTorch 0.936, missing 743 attacks instead of
+// 68 at the same 1% FPR). See npu/precision_ablation.py.
 //
-// WHY VECTOR, NOT SCALAR -- READ THIS BEFORE "SIMPLIFYING":
-// Two earlier attempts evaluated this same polynomial (and a Pade[7/6]
-// rational) in SCALAR fp32. Both DIVERGED on hardware: latents reached ~4e8,
-// though a GRU hidden state is mathematically confined to [-1,1]. The scalar
-// fp32 path on this core cannot be trusted -- and note the rest of this file
-// never depends on it either: matvec_bias always takes its VECTORIZED branch
-// (both cols=48 and cols=64 are multiples of 16), so its scalar fallback never
-// actually runs. Everything below therefore uses aie:: vector ops only.
+// Fix: keep getInvBf16 only as a SEED, then refine with two Newton-Raphson
+// steps:  r <- r * (2 - denom*r).  The relative error SQUARES each step
+// (~5% -> ~0.25% -> ~6e-6), so the reciprocal stops being the bottleneck and
+// sigmoid inherits the exp LUT's accuracy instead.
 //
-// EVERY aie::mul/add/sub RESULT IS MATERIALIZED into a named vector. Those
-// return an aie::accum, NOT a vector; chaining them -- e.g.
-// aie::mul(aie::add(a,b), c) -- compiles fine but silently yields WRONG VALUES
-// IN EVERY LANE (the "all 64 latent dims mismatch" symptom). Do not collapse
-// these statements.
+// This deliberately introduces NO new primitives. getExpBf16 and the per-lane
+// getInvBf16 loop are exactly as in the kernel that already works, and Newton
+// needs only vector mul/sub -- the same ops matvec_bias and the gate loop
+// already rely on. In particular: NO aie::max/min, and NO scalar fp32
+// arithmetic. Earlier attempts at this fix used those and produced divergence
+// (scalar fp32) or a badly inaccurate tanh (aie::max/min) on hardware.
 //
-// Simulated with bf16 rounding after every op (exactly what the vector unit
-// does): |tanh| <= 1 and sigmoid in [0,1] (guaranteed by the output clamp), and
-// end-to-end this restores the pipeline to inflation 1.02x / F1 0.938
-// (PyTorch: 0.937).
-// ---------------------------------------------------------------------------
-
-// Odd minimax polynomial for tanh on [-3, 3], evaluated by Horner in x^2:
-//   tanh(x) ~ x * (t1 + t3 x^2 + t5 x^4 + t7 x^6 + t9 x^8 + t11 x^10)
-static constexpr float kT1 = 9.8983037472e-01f;
-static constexpr float kT3 = -2.8898122907e-01f;
-static constexpr float kT5 = 7.3146112263e-02f;
-static constexpr float kT7 = -1.1429719627e-02f;
-static constexpr float kT9 = 9.4607059145e-04f;
-static constexpr float kT11 = -3.1460636819e-05f;
-
-// Clamp x into [lo, hi]. Vector-only (aie::max/min return vectors, not accums).
-inline aie::vector<bfloat16, 16>
-clamp16(const aie::vector<bfloat16, 16> &x, float lo, float hi) {
-  aie::vector<bfloat16, 16> vlo = aie::broadcast<bfloat16, 16>(lo);
-  aie::vector<bfloat16, 16> vhi = aie::broadcast<bfloat16, 16>(hi);
-  aie::vector<bfloat16, 16> t = aie::max(x, vlo);
-  aie::vector<bfloat16, 16> r = aie::min(t, vhi);
-  return r;
-}
-
-inline aie::vector<bfloat16, 16>
-tanh16(const aie::vector<bfloat16, 16> &x) {
-  // INPUT CLAMP IS MANDATORY: a polynomial diverges outside its fit interval,
-  // so an unclamped evaluation returns |tanh| >> 1 on large gate
-  // pre-activations and blows up the recurrence. tanh(3)=0.995, so this costs
-  // < 5e-3.
-  aie::vector<bfloat16, 16> v = clamp16(x, -3.0f, 3.0f);
-  aie::vector<bfloat16, 16> v2 = aie::mul(v, v); // materialize
-
-  // Horner in v2. Each coefficient is broadcast AT ITS POINT OF USE so only one
-  // is live at a time -- keeping all five live at once raises vector-register
-  // pressure enough to spill onto the ~1KB core stack, which is what made the
-  // decoder (the tighter of the two, ~1KB before spills) produce NaN while the
-  // encoder was already clean. Every aie::mul/add is still materialized into a
-  // named vector; broadcast returns a vector, so this is not accum chaining.
-  aie::vector<bfloat16, 16> r = aie::broadcast<bfloat16, 16>(kT11);
-  aie::vector<bfloat16, 16> t;
-
-  t = aie::mul(v2, r);
-  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT9));
-  t = aie::mul(v2, r);
-  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT7));
-  t = aie::mul(v2, r);
-  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT5));
-  t = aie::mul(v2, r);
-  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT3));
-  t = aie::mul(v2, r);
-  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT1));
-
-  aie::vector<bfloat16, 16> out = aie::mul(v, r); // materialize
-  // OUTPUT CLAMP: bf16 rounding through the Horner chain can overshoot to
-  // ~1.03, and the GRU needs |tanh| <= 1 to keep h inside [-1,1].
-  return clamp16(out, -1.0f, 1.0f);
-}
-
-// sigmoid(x) = 0.5 * (1 + tanh(x/2)). Bounded in [0,1] by the tanh clamp above,
-// so there is exactly ONE approximation in the kernel to validate.
+// Every aie::mul/add/sub result is materialized into a named vector -- they
+// return an aie::accum, NOT a vector, and chaining them corrupts every lane.
+//
+// Safety: denom = 1 + exp(-x) >= 1 always, so Newton can never divide by zero,
+// and it converges from any seed within (0, 2/denom) -- which a reciprocal
+// approximation of any sane quality satisfies.
 inline aie::vector<bfloat16, 16>
 sigmoid16(const aie::vector<bfloat16, 16> &x) {
-  aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
+  aie::vector<bfloat16, 16> zero = aie::broadcast<bfloat16, 16>(0.0f);
   aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
-  aie::vector<bfloat16, 16> hx = aie::mul(x, half); // materialize
-  aie::vector<bfloat16, 16> t = tanh16(hx);
-  aie::vector<bfloat16, 16> s = aie::add(one, t);    // materialize
-  aie::vector<bfloat16, 16> out = aie::mul(s, half); // materialize
-  return out;
+  aie::vector<bfloat16, 16> two = aie::broadcast<bfloat16, 16>(2.0f);
+  aie::vector<bfloat16, 16> neg_x = aie::sub(zero, x);              // -x
+  aie::vector<bfloat16, 16> e = to_v16bfloat16(getExpBf16(neg_x));  // exp(-x)
+  aie::vector<bfloat16, 16> denom = aie::add(one, e);               // 1 + exp(-x)
+
+  // Coarse seed, per lane -- unchanged from the working kernel.
+  alignas(aie::vector_decl_align) bfloat16 denom_arr[16];
+  alignas(aie::vector_decl_align) bfloat16 seed_arr[16];
+  aie::store_v(denom_arr, denom);
+  for (int j = 0; j < 16; j++)
+    seed_arr[j] = getInvBf16((float)denom_arr[j]); // ~1/denom, only ~5-8% exact
+  aie::vector<bfloat16, 16> r0 = aie::load_v<16>(seed_arr);
+
+  // Newton step 1: r1 = r0 * (2 - denom*r0)
+  aie::vector<bfloat16, 16> dr0 = aie::mul(denom, r0);
+  aie::vector<bfloat16, 16> c0 = aie::sub(two, dr0);
+  aie::vector<bfloat16, 16> r1 = aie::mul(r0, c0);
+
+  // Newton step 2: r2 = r1 * (2 - denom*r1)  (the relative error squares again)
+  aie::vector<bfloat16, 16> dr1 = aie::mul(denom, r1);
+  aie::vector<bfloat16, 16> c1 = aie::sub(two, dr1);
+  aie::vector<bfloat16, 16> r2 = aie::mul(r1, c1);
+
+  return r2;
+}
+
+// tanh(x) = 2*sigmoid(2x) - 1.
+inline aie::vector<bfloat16, 16>
+tanh16(const aie::vector<bfloat16, 16> &x) {
+  aie::vector<bfloat16, 16> two = aie::broadcast<bfloat16, 16>(2.0f);
+  aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  aie::vector<bfloat16, 16> two_x = aie::mul(x, two);
+  aie::vector<bfloat16, 16> s = sigmoid16(two_x);
+  aie::vector<bfloat16, 16> two_s = aie::mul(two, s);
+  return aie::sub(two_s, one);
 }
 
 // out[row] = sum_i(w[row*cols + i] * in[i]) + bias[row]. bf16 in/out, fp32
@@ -193,6 +161,10 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
+  // No h_prev copy: gh is computed from the FULL old h below, and the gate
+  // combine is elementwise, so each 16-lane block can simply load h[i..i+15]
+  // immediately before it overwrites them. Dropping that array frees 128B of the
+  // ~1KB core stack, giving Newton's extra vector registers room to live.
   alignas(aie::vector_decl_align) bfloat16 gi[H3];
   alignas(aie::vector_decl_align) bfloat16 gh[H3];
 
@@ -221,10 +193,7 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
     aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
     aie::vector<bfloat16, 16> n = tanh16(n_pre);
 
-    // Old h[i..i+15], loaded BEFORE this block's store below. No h_prev copy is
-    // needed: gh was already computed from the full old h above, and the
-    // combine is elementwise, so each 16-lane block only needs its own old h.
-    // (Dropping that array frees 128B of the ~1KB core stack.)
+    // Old h[i..i+15], loaded BEFORE this block's store below (no h_prev copy).
     aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h + i);
     aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
     aie::vector<bfloat16, 16> one_minus_z = aie::sub(one, z);
@@ -253,10 +222,7 @@ inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
-  // No h_prev array (see gru_step): each 16-lane block loads its own old h just
-  // before overwriting it. This is the tightest kernel on the ~1KB core stack --
-  // gru_decoder.cc's caller already holds gi[192]+h[64] (512B) live across the
-  // timestep loop -- so the 128B saved here matters.
+  // No h_prev copy -- see gru_step. Frees 128B of the ~1KB core stack.
   alignas(aie::vector_decl_align) bfloat16 gh[H3];
 
   matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
