@@ -458,3 +458,51 @@ python npu/precision_ablation.py --limit 40000
   threshold across paths.
 - In-kernel `sigmoid16` clamp backstop still optional (see above); not needed
   while inputs are clamped to |z|≤10.
+
+---
+
+## 10. RESOLVED — NPU reaches PyTorch parity (2026-07-14)
+
+The nonlinearity accuracy gap is CLOSED, confirmed on the full 114,956-window
+thesis-style test set (8,369 attacks), each path self-calibrated to its own
+normal-p99 threshold:
+
+```
+             thr      TP   FP     TN   FN    Prec    Rec     F1      FPR
+  NPU     0.13150   8307  1066  105521  62   0.8863  0.9926  0.9364  0.0100
+  PyTorch 0.09696   8317  1066  105521  52   0.8864  0.9938  0.9370  0.0100
+```
+
+NPU F1 0.9364 vs PyTorch 0.9370 (gap 6e-4); ROC-AUC 0.9986 vs 0.9989; Pearson
+r 0.9980. The NPU now misses 62 attacks vs PyTorch's 52 -- was 755 with the LUT.
+Threshold inflation fell from 6.06x to 1.36x. This is parity for any practical
+purpose; the residual is bf16 noise.
+
+### The fix (commit c9b68d3): Newton-refine the reciprocal
+Root cause was `getInvBf16` (the bit-manipulation reciprocal in the exp-LUT
+sigmoid), only ~5-8% accurate -- and since sigmoid's error == the reciprocal's
+error, that was the entire ~8-9% nonlinearity error. Keep getInvBf16 as a SEED,
+then two Newton steps `r <- r*(2 - denom*r)`; the error squares each step, so
+sigmoid inherits the exp LUT's accuracy. Six lines in sigmoid16, vector mul/sub
+only, NO new primitives. denom = 1+exp(-x) >= 1 so it cannot divide by zero.
+
+### What did NOT work (so nobody repeats it)
+- **Scalar fp32** Pade / polynomial (4 attempts, various layouts): DIVERGED on
+  hardware (latents ~4e8, though |h|<=1 mathematically). Scalar fp32 on the AIE
+  core is not trustworthy -- and the rest of the kernel never relies on it
+  (matvec_bias always takes its vectorized branch, cols 48 and 64 both %16==0).
+- **Vectorized polynomial with aie::max/min clamps**: ran, but computed a badly
+  inaccurate tanh (F1 dropped to 0.85). aie::max/min had no precedent here.
+- **`static` scratch arrays**: corrupted results -- the batch loop runs
+  independent windows the compiler can overlap, clobbering shared statics (NaN
+  rate rose monotonically with batch-slot index).
+- **Clip tuning (clip_zscore=6)**: no help. Tighter clip cuts NPU noise but also
+  shrinks the signal, so SNR at the operating point is invariant.
+The winning move was the MINIMAL delta from the known-good LUT kernel.
+
+### Optional follow-ups (speed only, accuracy is done)
+- Decoder still calls `gru_step` (recomputes the invariant `gi` 10x/window,
+  ~535us) rather than the hoisted `gru_step_with_gi`. That hoist was disabled
+  because its extra caller-held gi[H3] frame tipped the decoder over on an
+  EARLIER, heavier nonlinearity; with the lightweight Newton sigmoid it may fit
+  again. Re-enable + test on hardware for a ~2x decoder speedup.
