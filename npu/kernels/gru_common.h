@@ -226,8 +226,8 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
   // Safe to share across calls: timesteps are strictly serial (step t+1 needs h
   // from step t) and batch items run one after another, so two gru_step bodies
   // can never overlap. matvec_bias rewrites all H3 rows of gi/gh every call.
-  static alignas(aie::vector_decl_align) bfloat16 gi[H3];
-  static alignas(aie::vector_decl_align) bfloat16 gh[H3];
+  alignas(aie::vector_decl_align) static bfloat16 gi[H3];
+  alignas(aie::vector_decl_align) static bfloat16 gh[H3];
 
   matvec_bias(w_ih, x_in, b_ih, gi, H3, input_dim);
   matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
@@ -256,7 +256,7 @@ inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
   // STATIC (L1/BSS), not the stack -- same core-stack reasoning as gru_step
   // above (384B here). This is this function's own static, distinct from
   // gru_step's.
-  static alignas(aie::vector_decl_align) bfloat16 gh[H3];
+  alignas(aie::vector_decl_align) static bfloat16 gh[H3];
 
   matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
                                          // before gru_gate_combine touches h
