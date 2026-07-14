@@ -226,3 +226,75 @@ working step (the repo is on GitHub: `Warfian/FLAIR`).
 Repo also has a `.gitattributes` forcing LF for `npu/**` — if a shell script
 ever fails with `$'\r': command not found` on a fresh checkout, force a
 re-checkout of that file so the LF rule applies.
+
+---
+
+## 9. PROGRESS LOG (branch `flair-accuracy`, 2026-07-13)
+
+### Problem A NaN — root cause CONFIRMED, fix APPLIED (input clamp)
+
+The fork-in-the-road (§3/§7 step 3) is resolved: it is a **data-extreme
+problem that only the bf16/LUT path chokes on**, not a PyTorch/fp32 problem.
+
+Evidence (full inference split, 119,437 windows):
+- **PyTorch fp32 is 100% finite** on the whole split (scores up to 2.7e8). So
+  fp32's range absorbs the extremes; the NaN is specific to the NPU bf16 path.
+- Inputs are pathologically extreme: reusing the 1000-row **sample's mu/sigma**
+  makes full-dataset `TotBytes` z-score to **max|z| ≈ 2.36e5** (train reaches
+  **4.8e6**), vs the sample's own **max|z| = 33.4** (the range the model was
+  trained within). p99.9 ≈ 15 everywhere, so it's a razor-thin artifact tail.
+- These extremes are the shared precondition for the hypothesized
+  matvec/LUT overflow → NaN. The sample (max|z|=33) never NaNs; the full data
+  does — the only difference is input magnitude.
+
+**Fix (committed):** clamp z-scored numeric features to
+`[-clip_zscore, +clip_zscore]` (`config.yaml` → `preprocess.clip_zscore`,
+default **10.0**) right after normalization, in both `preprocess_data.py`
+paths (`main` and `main_split`). Because the clamp lives in preprocessing, the
+NPU embedding path AND the PyTorch reference both consume the same clamped
+`X_num` (satisfies §6 "match the reference"), and **no kernel rebuild is
+needed** — the existing prebuilt xclbins are still valid.
+
+clip=10 was chosen from data (not guessed): on a 200k-window labeled TRAIN
+subset it maximized PyTorch detection accuracy —
+**ROC-AUC 0.985 → 0.994, F1@p99 0.831 → 0.900** vs unclamped — and caps
+max score at ~27 (was 1.2e11). clip=5 over-clips (AUC drops to 0.986); 20/40
+are finite but less accurate. Regenerated splits now report `max|z| = 10` and
+PyTorch scores are finite (range 0.002–16.5 on inference).
+
+### STILL TO DO — validate on real NPU hardware
+This work was done on an Intel box with **no NPU / no XRT / no WSL**, so the
+on-hardware "NaN gone" confirmation is NOT yet done. To validate on the AMD
+7940HS+NPU machine (prebuilt binaries are in `Code/xcl/`: `batch_infer.exe`,
+`gru.xclbin`+`insts.bin`, `decoder.xclbin`+`decoder_insts.bin`):
+
+```
+# 1. regenerate the CLAMPED split with the committed config (clip_zscore: 10.0)
+python scripts/preprocess_data.py --split
+# 2. stage prebuilt binaries into npu/ and npu/build/ (batch_infer.exe + 4 build files)
+# 3. from npu/, run the full split reusing the prebuilt xclbins (no WSL build):
+python3 run_dataset_inference.py --npz ../data/processed/preprocessed_inference.npz \
+        --limit 0 --skip-build --skip-cpu-baseline
+# EXPECT: no "invalid value" warning, finite NPU scores, Pearson r ~1.0 vs PyTorch.
+# To reproduce the ORIGINAL NaN first, set clip_zscore: null, re-run step 1, run step 3.
+```
+
+Optional in-kernel backstop (defense-in-depth, NOT shipped — needs a rebuild,
+which reverts the "no rebuild" advantage): clamp the argument inside
+`sigmoid16` in `gru_common.h` to a saturation-safe range, e.g.
+`x = aie::min(aie::max(x, -20), 20)` before `getExpBf16(-x)`. Prefer the
+vector `aie::min/max` (no stack cost) over a scalar loop (adds ~32B to the
+~1KB core stack → corruption-NaN risk per §6). With inputs clamped to |z|≤10
+this path is never exercised, so it is purely belt-and-suspenders.
+
+### CORRECTION to §2/§7 — eval split has NO anomalies either
+The handoff assumed "the eval split HAS anomalies." It does **not**: this
+dataset's attacks are chronologically concentrated, so the 80/10/10
+time-ordered split puts **all 128,581 anomaly windows in TRAIN**; eval and
+inference are both 0-anomaly. So ROC-AUC/F1 must be measured on a TRAIN subset
+(as done above), or the split methodology changed, not on eval.
+
+### Problem B (soft drift) — not yet addressed
+Untouched. Note clamping should *reduce* drift too (smaller inputs → less
+bf16 error to compound), but the actual NPU-vs-PyTorch drift number needs the
+hardware run above to measure.
