@@ -39,86 +39,81 @@ static_assert(HIDDEN_DIM % 16 == 0,
 namespace flair {
 
 // ---------------------------------------------------------------------------
-// Nonlinearities: Pade[7/6] rational tanh, with sigmoid derived from it.
+// Nonlinearities: division-free polynomial tanh, sigmoid derived from it.
 //
-// REPLACES the old exp-LUT path (getExpBf16 + a raw getInvBf16 reciprocal).
-// That path was only ~8-9% accurate, and it was the ENTIRE NPU accuracy loss:
-// it inflated the normal-p99 detection threshold 6x and cost ~4 F1 points
-// (NPU 0.894 vs PyTorch 0.936). Crucially, bf16 rounding itself costs NOTHING
-// (1.00x inflation, F1 identical to PyTorch) -- so the nonlinearity was the
-// whole error budget. See npu/precision_ablation.py, which reproduces all of
-// this without hardware.
+// WHY: the old exp-LUT path (getExpBf16 + a raw getInvBf16 reciprocal) was only
+// ~8-9% accurate, and that was the ENTIRE NPU accuracy loss -- it inflated the
+// normal-p99 detection threshold 6x and cost ~4 F1 points (NPU 0.894 vs PyTorch
+// 0.936). bf16 rounding itself costs NOTHING (1.00x inflation, F1 identical to
+// PyTorch), so the nonlinearity was the whole error budget. See
+// npu/precision_ablation.py, which reproduces all of this without hardware.
 //
-// Validated in numpy over 2e6 points on [-30, 30]:
-//   * max |err| vs true tanh = 6.6e-4   (3.3e-3 after bf16 rounding, vs ~8-9%
-//     for the old LUT -- a ~25x improvement, well inside the <4% needed)
-//   * den >= 1 ALWAYS  -> the reciprocal is always finite -> CANNOT emit NaN
-//   * |tanh| <= 0.999344 < 1 -> gate math stays bounded, GRU stays stable
-//   * end-to-end pipeline sim: threshold inflation 6.06x -> 1.01x, F1 -> 0.938
+// HOW (and what it deliberately avoids -- do not "simplify" these away):
 //
-// THREE deliberate choices below. Each avoids a failure mode that has ALREADY
-// been hit on this kernel -- please do not "simplify" them away:
+//  1. THE CLAMP IS MANDATORY. A polynomial diverges outside its fit interval,
+//     so an unclamped evaluation returns |tanh| >> 1 on large gate
+//     pre-activations and destabilises the recurrence. Same trap as the earlier
+//     Pade form, whose num/den -> 0.0357*x as |x| -> inf.
 //
-//  1. THE +-4 CLAMP IS MANDATORY. The Pade rational does NOT saturate: its
-//     leading terms give num/den -> 0.0357*x as |x| -> inf, so an UNCLAMPED
-//     evaluation returns |tanh| > 1 on large gate pre-activations and
-//     destabilises the recurrence. tanh(4)=0.99933, so clamping costs < 7e-4.
+//  2. NO DIVISION, NO getInvBf16, NO LUT -- multiplies and adds only. An
+//     equally accurate Pade[7/6] rational was tried first, but it needs a
+//     reciprocal, and getInvBf16 + Newton was the one component never validated
+//     on this hardware; the encoder NaN'd with it. Removing the division
+//     removes that unknown. (If this STILL NaNs, the remaining suspect is
+//     scalar fp32 arithmetic on the AIE core itself -- note the old kernel
+//     barely used any: matvec_bias takes its VECTORIZED path for both cols=48
+//     and cols=64, so its scalar fallback never runs. The fix would then be to
+//     evaluate this polynomial with aie:: vector ops instead.)
 //
-//  2. SCALAR fp32, *not* aie:: vector ops. Per the notes at the top of this
-//     file, aie::mul/add/sub on bf16 vectors return an aie::accum, NOT a
-//     vector; a chained rational expression like aie::mul(aie::add(a,b),c)
-//     silently produces WRONG VALUES IN EVERY LANE -- exactly the "all 64
-//     latent dims mismatch" symptom a previous Pade attempt hit. The gate
-//     combine (gru_gate_combine, below) is therefore a plain scalar loop: it
-//     sidesteps the accum/vector trap entirely, needs no store_v/load_v scratch
-//     arrays, and keeps the ~0.4%-per-op bf16 rounding out of the polynomial.
-//     matvec_bias stays vectorized, so almost none of the FLOPs are lost.
+//  3. SCALAR, *not* chained aie:: vector ops. aie::mul/add/sub on bf16 vectors
+//     return an aie::accum, NOT a vector; chaining them (e.g.
+//     aie::mul(aie::add(a,b),c)) silently yields WRONG VALUES IN EVERY LANE --
+//     the "all 64 latent dims mismatch" symptom. gru_gate_combine is therefore
+//     a plain scalar loop, which sidesteps that trap, needs no store_v/load_v
+//     scratch, and keeps bf16 rounding out of the polynomial. matvec_bias stays
+//     vectorized, so almost none of the FLOPs are lost.
 //
-//  3. RECIPROCAL = getInvBf16 SEED + 2 NEWTON STEPS, not a bare '/'. Newton
-//     needs only multiply/subtract (certainly available) and squares the
-//     relative error each step, so the result is accurate even though the raw
-//     getInvBf16 seed is coarse -- and that coarse seed is itself a prime
-//     suspect for the old path's error. (Plain `num / den` is equivalent if the
-//     toolchain provides scalar fp32 divide; this form simply does not depend
-//     on that, and avoids emitting a soft-float call that would cost stack.)
-//
-// STACK: this costs only a handful of fp32 temporaries -- no scratch arrays at
-// all. Combined with moving gi/gh to static (see gru_step), the ~1KB core stack
-// has ample headroom, which is what killed the first attempt at this change.
+// STACK: only a handful of fp32 temporaries, no scratch arrays. gi/gh are also
+// static (see gru_step), so the ~1KB core stack has ample headroom.
 // ---------------------------------------------------------------------------
 
-// Pade[7/6] tanh coefficients, normalised by 135135 so every intermediate stays
-// O(1). (The textbook form has coefficients up to 135135 and x^6 terms, which
-// would burn bf16 exponent range for no benefit.)
-//   tanh(x) ~ x*(1 + a1 x^2 + a2 x^4 + a3 x^6) / (1 + b1 x^2 + b2 x^4 + b3 x^6)
-static constexpr float kPadeA1 = 0.1282051282f; // 17325/135135
-static constexpr float kPadeA2 = 0.0027972028f; //   378/135135
-static constexpr float kPadeA3 = 7.4000740e-6f; //     1/135135
-static constexpr float kPadeB1 = 0.4615384615f; // 62370/135135
-static constexpr float kPadeB2 = 0.0233100233f; //  3150/135135
-static constexpr float kPadeB3 = 2.0720207e-4f; //    28/135135
-static constexpr float kPadeClamp = 4.0f;
+// Minimax-fitted ODD polynomial for tanh, degree 11, valid on [-3, 3]:
+//   tanh(x) ~ x * (t1 + t3 x^2 + t5 x^4 + t7 x^6 + t9 x^8 + t11 x^10)
+// evaluated by Horner in x^2. DIVISION-FREE by design: only multiplies and
+// adds, so it needs neither getInvBf16 nor a scalar fp32 divide. (The earlier
+// Pade[7/6] form was equally accurate but required a reciprocal; getInvBf16 +
+// Newton was the last component never validated on this hardware, and the
+// encoder NaN'd with it. Removing the division removes that unknown entirely.)
+//
+// numpy-validated over [-40, 40] (800k points):
+//   max |err| vs true tanh = 6.9e-3 (0.69%)  -- far inside the <4% needed
+//   max |out| = 0.996053 < 1  -> gate math bounded, recurrence stable
+//   finite everywhere; end-to-end pipeline sim: inflation 1.01x, F1 0.938
+static constexpr float kTanhClamp = 3.0f;
+static constexpr float kT1 = 9.8983037472e-01f;
+static constexpr float kT3 = -2.8898122907e-01f;
+static constexpr float kT5 = 7.3146112263e-02f;
+static constexpr float kT7 = -1.1429719627e-02f;
+static constexpr float kT9 = 9.4607059145e-04f;
+static constexpr float kT11 = -3.1460636819e-05f;
 
-// 1/d for d >= 1. Coarse seed + 2 Newton-Raphson steps: r <- r*(2 - d*r).
-// The relative error squares each step, so even a poor seed converges. Callers
-// guarantee d >= 1, so this can never divide by zero and never returns NaN.
-static inline float flair_recip(float d) {
-  float r = (float)getInvBf16(d);
-  r = r * (2.0f - d * r);
-  r = r * (2.0f - d * r);
-  return r;
-}
-
-// Pade tanh for a single lane, evaluated in fp32.
+// tanh for a single lane, fp32, multiply/add only.
 static inline float flair_tanh_f32(float v) {
-  if (v > kPadeClamp)
-    v = kPadeClamp; // MANDATORY: the Pade does not saturate (see note 1)
-  else if (v < -kPadeClamp)
-    v = -kPadeClamp;
+  // MANDATORY clamp: a polynomial diverges outside its fit interval, so an
+  // unclamped evaluation would return |tanh| >> 1 on large gate pre-activations
+  // and blow up the recurrence. tanh(3)=0.99505, so clamping costs < 5e-3.
+  if (v > kTanhClamp)
+    v = kTanhClamp;
+  else if (v < -kTanhClamp)
+    v = -kTanhClamp;
   const float v2 = v * v;
-  const float num = v * (1.0f + v2 * (kPadeA1 + v2 * (kPadeA2 + v2 * kPadeA3)));
-  const float den = 1.0f + v2 * (kPadeB1 + v2 * (kPadeB2 + v2 * kPadeB3));
-  return num * flair_recip(den); // den >= 1 -> always finite, |result| < 1
+  float r = kT11;
+  r = kT9 + v2 * r;
+  r = kT7 + v2 * r;
+  r = kT5 + v2 * r;
+  r = kT3 + v2 * r;
+  r = kT1 + v2 * r;
+  return v * r; // |result| <= 0.9961 by construction
 }
 
 // sigmoid(x) = 0.5 * (1 + tanh(x/2)). Derived from the tanh above, so the kernel
