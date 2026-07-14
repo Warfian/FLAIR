@@ -194,6 +194,12 @@ def main() -> None:
                         "random --sample of train gives ~13.5%% anomalies.")
     p.add_argument("--sample-seed", type=int, default=0,
                    help="RNG seed for --sample (reproducible subset).")
+    p.add_argument("--ckpt", type=str, default=None,
+                   help="checkpoint to load (default: flair_minimal.pt). Use "
+                        "experiments/results/flair_h64_full.pt with the "
+                        "--split-eval retrain_test.npz to validate the properly "
+                        "trained NPU-sized model on hardware. Same hidden=64, so "
+                        "weights drop into the param .bin -- no xclbin rebuild.")
     p.add_argument("--xrt-inc-dir", type=str, default=None)
     p.add_argument("--xrt-lib-dir", type=str, default=None)
     p.add_argument("--skip-build", action="store_true",
@@ -221,7 +227,8 @@ def main() -> None:
     B_dec = args.batch_decoder
     B_lcm = math.lcm(B_enc, B_dec)
 
-    ckpt = torch.load(str(_CKPT), map_location="cpu")
+    ckpt_path = Path(args.ckpt) if args.ckpt else _CKPT
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
     sd = ckpt["model_state_dict"]
     cfg = FLAIRConfig(**ckpt["model_cfg"])
     model = FLAIRAutoencoder(cfg)
