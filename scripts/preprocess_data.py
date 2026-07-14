@@ -102,6 +102,20 @@ def zscore_normalize_numeric(X_num: np.ndarray, y_row: np.ndarray) -> Tuple[np.n
     X_scaled = ((X_num - mu) / sigma).astype(np.float32)
     return X_scaled, mu, sigma
 
+
+def clip_zscore(X: np.ndarray, clip: Optional[float]) -> np.ndarray:
+    """Clamp z-scored features to [-clip, +clip]. See preprocess.clip_zscore in
+    config.yaml for the rationale (bf16/LUT NaN backstop + keeping inference
+    inside the trained input range). A clip of None/<=0 is a no-op."""
+    if clip is None or clip <= 0:
+        return X
+    return np.clip(X, -clip, clip).astype(np.float32)
+
+
+def get_clip_value(cfg: dict) -> Optional[float]:
+    v = cfg.get("preprocess", {}).get("clip_zscore", None)
+    return float(v) if v is not None else None
+
 # Turns a flat table of flows into the (N, T, D) sequence format the GRU model expects
 def build_sliding_windows(
     X_num: np.ndarray,
@@ -206,6 +220,9 @@ def main(config_path: str = "config.yaml") -> None:
     # ---------------------------
     X_num_raw = work[NUMERIC_FEATURES].to_numpy(dtype=np.float32)
     X_num, mu, sigma = zscore_normalize_numeric(X_num_raw, y_row)
+    clip = get_clip_value(cfg)
+    X_num = clip_zscore(X_num, clip)
+    print(f"[preprocess] clip_zscore={clip}  post-clip max|z|={np.abs(X_num).max():.4g}")
 
     # ---------------------------
     # Windows
@@ -341,6 +358,9 @@ def main_split(config_path: str = "config.yaml") -> None:
     ], axis=1).astype(np.int64)
 
     X_num = ((X_num_raw - mu) / sigma).astype(np.float32)
+    clip = get_clip_value(cfg)
+    X_num = clip_zscore(X_num, clip)
+    print(f"[preprocess-split] clip_zscore={clip}  post-clip max|z|={np.abs(X_num).max():.4g}")
 
     splits = {
         "train": (tr_start, tr_end, out_train),

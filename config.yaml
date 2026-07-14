@@ -55,6 +55,17 @@ preprocess:
   dropna: true                    # drop rows with missing feature values
   # optional: if StartTime is a string, we will parse it in code
 
+  # Clamp z-scored numeric features to [-clip_zscore, +clip_zscore] AFTER
+  # normalization. Required for the NPU path: mu/sigma come from the tiny
+  # sample (see paths.vocab_reference_npz), so full-dataset extremes (e.g.
+  # TotBytes) z-score to |z| up to ~5e6 -- values the model never saw in
+  # training that (a) drive the bf16/LUT GRU kernels toward overflow/NaN and
+  # (b) let one preprocessing artifact dominate the anomaly score. Clamping to
+  # 10 keeps inputs inside the trained distribution (sample p99 ~ 11) and, on a
+  # 200k-window labeled train subset, IMPROVED PyTorch ROC-AUC 0.985 -> 0.994
+  # and F1@p99 0.831 -> 0.900 vs unclamped. Set to null/0 to disable.
+  clip_zscore: 10.0
+
   # 80/10/10 train/eval/inference split of paths.full_csv_split, used by
   # `python scripts/preprocess_data.py --split`. Chronological (time-sorted)
   # so each window's rows stay within a single split.
