@@ -97,24 +97,25 @@ tanh16(const aie::vector<bfloat16, 16> &x) {
   aie::vector<bfloat16, 16> v = clamp16(x, -3.0f, 3.0f);
   aie::vector<bfloat16, 16> v2 = aie::mul(v, v); // materialize
 
-  aie::vector<bfloat16, 16> c1 = aie::broadcast<bfloat16, 16>(kT1);
-  aie::vector<bfloat16, 16> c3 = aie::broadcast<bfloat16, 16>(kT3);
-  aie::vector<bfloat16, 16> c5 = aie::broadcast<bfloat16, 16>(kT5);
-  aie::vector<bfloat16, 16> c7 = aie::broadcast<bfloat16, 16>(kT7);
-  aie::vector<bfloat16, 16> c9 = aie::broadcast<bfloat16, 16>(kT9);
+  // Horner in v2. Each coefficient is broadcast AT ITS POINT OF USE so only one
+  // is live at a time -- keeping all five live at once raises vector-register
+  // pressure enough to spill onto the ~1KB core stack, which is what made the
+  // decoder (the tighter of the two, ~1KB before spills) produce NaN while the
+  // encoder was already clean. Every aie::mul/add is still materialized into a
+  // named vector; broadcast returns a vector, so this is not accum chaining.
   aie::vector<bfloat16, 16> r = aie::broadcast<bfloat16, 16>(kT11);
   aie::vector<bfloat16, 16> t;
 
-  t = aie::mul(v2, r); // Horner in v2; every step materialized
-  r = aie::add(t, c9);
   t = aie::mul(v2, r);
-  r = aie::add(t, c7);
+  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT9));
   t = aie::mul(v2, r);
-  r = aie::add(t, c5);
+  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT7));
   t = aie::mul(v2, r);
-  r = aie::add(t, c3);
+  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT5));
   t = aie::mul(v2, r);
-  r = aie::add(t, c1);
+  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT3));
+  t = aie::mul(v2, r);
+  r = aie::add(t, aie::broadcast<bfloat16, 16>(kT1));
 
   aie::vector<bfloat16, 16> out = aie::mul(v, r); // materialize
   // OUTPUT CLAMP: bf16 rounding through the Horner chain can overshoot to
@@ -194,14 +195,10 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
 
   alignas(aie::vector_decl_align) bfloat16 gi[H3];
   alignas(aie::vector_decl_align) bfloat16 gh[H3];
-  alignas(aie::vector_decl_align) bfloat16 h_prev[H];
 
   matvec_bias(w_ih, x_in, b_ih, gi, H3, input_dim);
-  matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses old h
-  // Save old h (aligned) for the z*h_prev term; after this, h may be
-  // overwritten with the new hidden state.
-  for (int i = 0; i < H; i++)
-    h_prev[i] = h[i];
+  matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
+                                         // before the combine loop touches h
 
   const bfloat16 *gi_r = gi, *gi_z = gi + H, *gi_n = gi + 2 * H;
   const bfloat16 *gh_r = gh, *gh_z = gh + H, *gh_n = gh + 2 * H;
@@ -224,7 +221,11 @@ inline void gru_step(const bfloat16 *restrict x_in, bfloat16 *restrict h,
     aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
     aie::vector<bfloat16, 16> n = tanh16(n_pre);
 
-    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
+    // Old h[i..i+15], loaded BEFORE this block's store below. No h_prev copy is
+    // needed: gh was already computed from the full old h above, and the
+    // combine is elementwise, so each 16-lane block only needs its own old h.
+    // (Dropping that array frees 128B of the ~1KB core stack.)
+    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h + i);
     aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
     aie::vector<bfloat16, 16> one_minus_z = aie::sub(one, z);
     aie::vector<bfloat16, 16> term1 = aie::mul(one_minus_z, n);
@@ -252,12 +253,14 @@ inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
   constexpr int H = HIDDEN_DIM;
   constexpr int H3 = 3 * H;
 
+  // No h_prev array (see gru_step): each 16-lane block loads its own old h just
+  // before overwriting it. This is the tightest kernel on the ~1KB core stack --
+  // gru_decoder.cc's caller already holds gi[192]+h[64] (512B) live across the
+  // timestep loop -- so the 128B saved here matters.
   alignas(aie::vector_decl_align) bfloat16 gh[H3];
-  alignas(aie::vector_decl_align) bfloat16 h_prev[H];
 
-  matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses old h
-  for (int i = 0; i < H; i++)
-    h_prev[i] = h[i];
+  matvec_bias(w_hh, h, b_hh, gh, H3, H); // uses the FULL old h -- must run
+                                         // before the combine loop touches h
 
   const bfloat16 *gi_r = gi, *gi_z = gi + H, *gi_n = gi + 2 * H;
   const bfloat16 *gh_r = gh, *gh_z = gh + H, *gh_n = gh + 2 * H;
@@ -280,7 +283,8 @@ inline void gru_step_with_gi(const bfloat16 *restrict gi, bfloat16 *restrict h,
     aie::vector<bfloat16, 16> n_pre = aie::add(vgi_n, r_gh_n);
     aie::vector<bfloat16, 16> n = tanh16(n_pre);
 
-    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h_prev + i);
+    // Old h[i..i+15], loaded BEFORE this block's store below (no h_prev copy).
+    aie::vector<bfloat16, 16> vh_prev = aie::load_v<16>(h + i);
     aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
     aie::vector<bfloat16, 16> one_minus_z = aie::sub(one, z);
     aie::vector<bfloat16, 16> term1 = aie::mul(one_minus_z, n);
