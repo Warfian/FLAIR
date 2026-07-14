@@ -378,22 +378,50 @@ Diagnosed from the per-window scores CSV:
   0.1–0.6). No global additive/multiplicative correction recovers it (tested) —
   it is added variance, not offset; even label-informed best-F1 caps NPU at 0.899.
 
-**Lever (validated PyTorch-side, pending NPU confirmation):** clip tighter.
-Since the noise scales with |z|, capping |z| at 6 instead of 10 shrinks exactly
-the activations driving the error. Retrained at clip=6, PyTorch cost is
-negligible (F1 0.9418→0.9399, ROC-AUC unchanged) — so it should lower the NPU
-threshold and recover recall at almost no accuracy cost. Checkpoint committed:
-`experiments/results/flair_h64_clip6.pt`. To test on the NPU:
+#### Clip lever: TESTED ON NPU, DOES NOT WORK (negative result)
+Retrained at clip=6 (`flair_h64_clip6.pt`) and ran it on the NPU. It cut the NPU
+noise (noise p99 0.553→0.446, −19%) — but the tighter clip ALSO makes the model
+reconstruct better, shrinking the signal (PyTorch normal p99 0.103→0.091, −12%).
+**Noise and signal scale together with input magnitude, so the SNR at the
+operating point is invariant to clipping:** threshold inflation 6.06x → 5.87x,
+NPU F1 0.8940 → 0.8936. No gain. (ROC-AUC did improve 0.992→0.997, since bulk
+noise halved — but the p99 *tail* that sets the threshold did not.) Do not
+pursue clipping for accuracy; keep clip=10 (it is still required for the NaN).
+
+#### ROOT CAUSE FOUND: it is the sigmoid/tanh LUT, NOT bf16
+`npu/precision_ablation.py` simulates the exact pipeline with each precision
+source toggled. Decisive result (hidden=64 model, thesis-style test set):
+
+| configuration                              | threshold inflation | F1     |
+|--------------------------------------------|--------------------|--------|
+| PyTorch fp32                                | 1.00x              | 0.9361 |
+| **bf16 gates + hidden + MAC operands, EXACT sigmoid/tanh** | **1.00x** | **0.9361** |
+| bf16 + 2% rel err in nonlinearity           | 1.05x              | 0.9382 |
+| bf16 + 4% rel err                           | 1.21x              | 0.9371 |
+| bf16 + 8% rel err                           | 4.30x              | 0.9074 |
+| bf16 + 10% rel err                          | 8.87x              | 0.8733 |
+| **real NPU**                                | **6.06x**          | **0.8940** |
+
+- **bf16 rounding costs literally nothing** (1.00x, F1 identical to PyTorch). So
+  keeping `gi`/`gh`/`h` in fp32 in the kernel would gain NOTHING — don't bother.
+- The real NPU sits between the 8% and 10% rows ⇒ **the exp-LUT sigmoid/tanh is
+  only ~8–9% accurate** (≈1 decimal digit), and that is the ENTIRE accuracy loss.
+- **Target: get nonlinearity relative error under ~4%** → inflation ≤1.2x and F1
+  returns to ~0.937 (i.e. full PyTorch parity, recovering 0.894 → 0.937).
+
+**Recommended fix (Problem B, the only remaining lever):** replace
+`sigmoid16`/`tanh16` in `gru_common.h` with a more accurate vectorized
+approximation. The previously-abandoned **Padé[7/6] tanh (numpy-validated ~6e-4
+error, unbiased)** is ~100x more accurate than the ~4% needed — it was dropped
+for compiler/stack reasons, not accuracy. Any decent polynomial/rational
+sigmoid+tanh that stays in vector registers (no large scalar stack arrays — see
+§6 stack-overflow NaN) will do. This is the whole ballgame; nothing else moves
+the needle.
+
+Reproduce/verify the analysis (no NPU needed):
 ```
-# set preprocess.clip_zscore: 6.0 in config.yaml, then:
-python scripts/preprocess_data.py --split-eval          # regen retrain_test.npz at clip=6
-python3 run_dataset_inference.py --npz ../data/processed/retrain_test.npz \
-        --ckpt ../experiments/results/flair_h64_clip6.pt --skip-build --skip-cpu-baseline
-# MUST use the clip=6 npz with the clip=6 ckpt (train/inference clip must match).
+python npu/precision_ablation.py --limit 40000
 ```
-If confirmed, clip=6 (or a swept optimum) becomes the NPU-deployment default.
-The deeper fix is higher-precision LUT nonlinearity (Problem B proper), but the
-clip lever is far cheaper if it lands.
 
 ### Remaining / optional
 - Held-out generalization metric: needs a split where held-out data contains
