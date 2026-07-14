@@ -326,6 +326,41 @@ above). So do not chase the rel-err number — it is expected from bf16/LUT and
 is absorbed by per-path threshold calibration. `run_dataset_inference.py` now
 prints these calibrated metrics and labels rel-err "INFO ONLY".
 
+### Proper (non-toy) accuracy — thesis-style split + retrained hidden=64
+`flair_minimal.pt` is a TOY (hidden=64 trained on the 1000-row sample), so its
+metrics only measure NPU↔PyTorch fidelity, not real detection quality. Per
+Dumond's FLAIR thesis Sec 3.6, proper testing needs normal-only train/val and a
+test set with attacks *sampled in* (a pure chronological slice is all-normal —
+that is why our eval/inference splits had 0 anomalies).
+
+Implemented:
+- `preprocess_data.py --split-eval` → `retrain_{train,val,test}.npz`. Fresh
+  mu/sigma on train-normal rows; test = newest normal + attacks sampled to
+  7.28%. Reproduces the thesis test set (106,587 normal + 8,369 attack =
+  114,956; thesis: 114,957 / 8,369).
+- `scripts/retrain_eval_model.py` → `experiments/results/flair_h64_full.pt`
+  (hidden=64, normal-only, 200k subsampled train windows, best val 0.0246).
+- `scripts/eval_thesis_style.py` (operational p99-of-val-normal threshold +
+  best-F1 + ROC/PR-AUC).
+
+Result (held-out test, operational τ = 0.1115):
+```
+Precision 0.8973  Recall 0.9909  F1 0.9418  FPR 0.0089   ROC-AUC 0.9988
+best-F1 upper bound 0.9683
+```
+This NPU-sized model **matches/beats the thesis hidden=128** (F1 0.9320,
+ROC-AUC 0.9994) and is a genuine generalization number (attacks fully excluded
+from train/val). Note vocabs are large (sport 51,058) from the full data — fine
+for the NPU (host-side embedding lookup; the tile sees only the 45-dim input).
+
+To validate THIS model on the NPU (no rebuild — hidden=64):
+```
+python scripts/preprocess_data.py --split-eval    # build retrain_test.npz
+python3 run_dataset_inference.py --npz ../data/processed/retrain_test.npz \
+        --ckpt ../experiments/results/flair_h64_full.pt \
+        --skip-build --skip-cpu-baseline
+```
+
 ### Remaining / optional
 - Held-out generalization metric: needs a split where held-out data contains
   anomalies (current chronological split is train-only for anomalies). Change
