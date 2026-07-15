@@ -37,11 +37,22 @@
     const cpu = status.cpu || {};
     const npu = status.npu || {};
 
+    // When finished, show pure INFERENCE time (the same basis as the headline
+    // speedup). The live per-worker wall-clock (elapsed_ms) also includes
+    // one-time overhead that isn't inference -- loading two xclbins per click,
+    // the batch_infer subprocess launches, dataset load, and the demo's
+    // PyTorch-reference computation -- which made the NPU's wall-clock look
+    // longer than the CPU's despite faster inference. Using inference time
+    // here keeps the lane seconds consistent with the "N x faster" number.
+    const done = status.state === "done" && status.result;
+    const cpuDisplayMs = done ? status.result.cpu.inference_ms : (cpu.elapsed_ms || 0);
+    const npuDisplayMs = done ? status.result.npu.inference_ms : (npu.elapsed_ms || 0);
+
     const cpuTotal = cpu.total || knownLimit || 1;
     const cpuPct = Math.min(100, (100 * (cpu.done || 0)) / cpuTotal);
     cpuFill.style.width = cpuPct + "%";
     cpuCount.textContent = `${cpu.done || 0} / ${cpuTotal}`;
-    cpuTime.textContent = fmtSeconds(cpu.elapsed_ms || 0);
+    cpuTime.textContent = fmtSeconds(cpuDisplayMs);
 
     // NPU runs two sequential passes (encoder, then decoder) over the same
     // N windows; treat that as one combined 0-100% bar so it's easy to read.
@@ -51,8 +62,12 @@
     const npuPct = Math.min(100, (100 * npuDoneCombined) / (npuTotal * 2));
     npuFill.style.width = npuPct + "%";
     npuCount.textContent = `${npu.done || 0} / ${npuTotal}`;
-    npuTime.textContent = fmtSeconds(npu.elapsed_ms || 0);
+    npuTime.textContent = fmtSeconds(npuDisplayMs);
     npuStageLabel.textContent = status.state === "running" ? stageName(npu.stage) : "";
+
+    // The inference-time clarification is only meaningful once times are shown.
+    const raceNote = $("race-note");
+    if (raceNote) raceNote.hidden = !(done || status.state === "running");
 
     if (status.state === "error") {
       errorBanner.hidden = false;

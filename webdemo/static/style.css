@@ -344,3 +344,12 @@ footer {
 .tp-npu-wins { background: rgba(51, 224, 176, 0.14); color: var(--npu); }
 .tp-cpu-wins { background: rgba(90, 169, 255, 0.14); color: var(--cpu); }
 .throughput-note { color: var(--text-dim); font-size: 13px; line-height: 1.5; }
+
+/* Clarifies that lane times are inference-only (setup excluded). */
+.race-note {
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 2px 4px 0;
+  max-width: 720px;
+}
