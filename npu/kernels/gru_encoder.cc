@@ -73,12 +73,24 @@ void gru_encoder_impl(bfloat16 *restrict x_window, bfloat16 *restrict params,
     for (int i = 0; i < H; i++)
       h[i] = (bfloat16)0.0f;
 
+    // Per-timestep gi (the encoder's x_t CHANGES every step, so gi is NOT
+    // invariant -- can't hoist like the decoder). Computed here in the caller,
+    // then fed to gru_step_with_gi. This is IDENTICAL math to the old
+    // gru_step(x_t, ...) call (gi = w_ih @ x_t + b_ih, then gh + gate), but
+    // routes the gate loop through gru_step_with_gi -- the leaner function the
+    // decoder uses, which measures far faster on hardware than the monolithic
+    // gru_step for the same work (encoder was 417us/window of pure compute,
+    // ~165us above a component model; diag_encoder_timing localized it to the
+    // gru_step path, not DMA). Peak stack frame is caller gi(384) +
+    // gru_step_with_gi gh(384) + h(128) = 896B, same as the old gru_step path.
+    alignas(aie::vector_decl_align) bfloat16 gi[H3];
     for (int t = 0; t < T; t++) {
       // x_window_b[t] is a length-INPUT_DIM slice at element offset
-      // t*INPUT_DIM. gru_step reads x_in scalar-only, so this unaligned
-      // offset is fine.
+      // t*INPUT_DIM. matvec_bias reads x_in scalar/vector; the offset t*48 is
+      // 32-byte aligned (48 = 3*16), so the vectorized path is valid.
       const bfloat16 *restrict x_t = x_window_b + t * INPUT_DIM;
-      flair::gru_step(x_t, h, w_ih, w_hh, b_ih, b_hh, INPUT_DIM);
+      flair::matvec_bias(w_ih, x_t, b_ih, gi, H3, INPUT_DIM);
+      flair::gru_step_with_gi(gi, h, w_hh, b_hh);
     }
 
     for (int i = 0; i < H; i++)
