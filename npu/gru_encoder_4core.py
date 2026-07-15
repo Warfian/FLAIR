@@ -116,9 +116,13 @@ def gru_encoder_4core(
     )
 
     # --- params: shim -> memtile -> broadcast to all N cores (shared) ---
-    params_fifo = ObjectFifo(params_ty, name="params")
+    # depth=1 is MANDATORY: params is 43776 B, and the default depth-2
+    # ping-pong would put TWO copies (87 KB) in every core's 64 KB L1 ->
+    # overflow. Weights are resident/read-only (loaded once, reused across the
+    # whole batch), so there's no prefetch benefit to double-buffering anyway.
+    params_fifo = ObjectFifo(params_ty, depth=1, name="params")
     params_bcast = params_fifo.cons().forward(
-        obj_type=params_ty, name="params_bcast"
+        obj_type=params_ty, depth=1, name="params_bcast"
     )
 
     # --- latents: N cores -> memtile -> join -> shim (gather) ---
