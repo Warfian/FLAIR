@@ -221,10 +221,20 @@ def main() -> None:
                         "cost for reasons in the compiled design, not the "
                         "matvec compute), so it's not used here. Decoder tile "
                         "budget caps this near 6-7 (1408B/window output).")
+    p.add_argument("--encoder-4core", action="store_true",
+                   help="use the 4-core data-parallel encoder (one NPU column, "
+                        "memtile weight broadcast) instead of the single-core "
+                        "encoder. batch-encoder must be a multiple of 4; each "
+                        "core runs batch-encoder/4 windows. ~3.5x encoder "
+                        "throughput. Output is bf16-noise-close (~0.003) to the "
+                        "single-core -- validated by F1, not bit-equality.")
     args = p.parse_args()
     T = args.seq_len
     B_enc = args.batch_encoder
     B_dec = args.batch_decoder
+    if args.encoder_4core and B_enc % 4 != 0:
+        sys.exit(f"--encoder-4core requires --batch-encoder a multiple of 4 "
+                 f"(got {B_enc})")
     B_lcm = math.lcm(B_enc, B_dec)
 
     ckpt_path = Path(args.ckpt) if args.ckpt else _CKPT
@@ -317,11 +327,20 @@ def main() -> None:
         # see flair-npu-iron-kernel-gotchas memory item 10). Without this, a
         # kernel edit can silently test stale, unchanged compiled code.
         shutil.rmtree(_HERE / "build" / "gru.prj", ignore_errors=True)
+        shutil.rmtree(_HERE / "build" / "gru_4core.prj", ignore_errors=True)
         shutil.rmtree(_HERE / "build" / "decoder.prj", ignore_errors=True)
-        sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
-            str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
-            str(T), "--batch", str(B_enc), "--xclbin-path", "build/gru.xclbin",
-            "--insts-path", "build/insts.bin"])
+        if args.encoder_4core:
+            # 4-core: each core runs B_enc//4 windows; one dispatch = B_enc
+            # windows across the column (memtile scatter/broadcast/gather).
+            sh(["python3", "gru_encoder_4core.py", "--dev", "npu", "--input-dim",
+                str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
+                str(T), "--batch", str(B_enc // 4), "--xclbin-path",
+                "build/gru_4core.xclbin", "--insts-path", "build/gru_4core_insts.bin"])
+        else:
+            sh(["python3", "gru_encoder.py", "--dev", "npu", "--input-dim",
+                str(INPUT_DIM_PADDED), "--hidden-dim", str(HIDDEN_DIM), "--seq-len",
+                str(T), "--batch", str(B_enc), "--xclbin-path", "build/gru.xclbin",
+                "--insts-path", "build/insts.bin"])
         sh(["python3", "gru_decoder.py", "--dev", "npu", "--hidden-dim",
             str(HIDDEN_DIM), "--seq-len", str(T), "--batch", str(B_dec),
             "--xclbin-path", "build/decoder.xclbin", "--insts-path",
@@ -331,8 +350,15 @@ def main() -> None:
     ps = "powershell.exe"
 
     # --- 2. NPU encoder pass ---
-    print("\n[encoder] batched NPU pass")
-    enc_stdout = sh_capture([ps, "./batch_infer.exe", "build/gru.xclbin", "build/insts.bin",
+    # Both encoders present B_enc windows/dispatch to batch_infer; the 4-core
+    # design splits them across 4 cores internally via the memtile.
+    if args.encoder_4core:
+        enc_xclbin, enc_insts = "build/gru_4core.xclbin", "build/gru_4core_insts.bin"
+        print("\n[encoder] batched NPU pass (4-core data-parallel)")
+    else:
+        enc_xclbin, enc_insts = "build/gru.xclbin", "build/insts.bin"
+        print("\n[encoder] batched NPU pass")
+    enc_stdout = sh_capture([ps, "./batch_infer.exe", enc_xclbin, enc_insts,
         "all_x_windows.bin", "enc_params.bin", "all_latents.bin",
         str(N_pad), str(B_enc), str(enc_in1_vol), str(n_enc_params), str(HIDDEN_DIM)])
     enc_us_per_window = parse_us_per_window(enc_stdout)
