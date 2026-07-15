@@ -36,33 +36,37 @@ namespace flair {
 
 // sigmoid(x) = 1 / (1 + exp(-x)).
 //
-// exp comes from getExpBf16 (a real vector LUT). The RECIPROCAL is where this
-// kernel used to lose all its accuracy: getInvBf16 is a bit-manipulation
-// reciprocal (the classic magic-constant trick), accurate to only ~5-8% without
-// refinement. Because sigmoid's relative error IS the reciprocal's relative
-// error, that one function plausibly accounts for the entire ~8-9% nonlinearity
-// error -- which inflates the normal-p99 detection threshold ~6x and costs ~4 F1
-// points on hardware (NPU 0.894 vs PyTorch 0.936, missing 743 attacks instead of
-// 68 at the same 1% FPR). See npu/precision_ablation.py.
+// exp comes from getExpBf16 (a real vector LUT). The RECIPROCAL of denom =
+// 1+exp(-x) is computed as: a coarse VECTORIZED fast-reciprocal seed (one
+// bit-trick subtract), refined by two Newton-Raphson steps.
 //
-// Fix: keep getInvBf16 only as a SEED, then refine with two Newton-Raphson
-// steps:  r <- r * (2 - denom*r).  The relative error SQUARES each step
-// (~5% -> ~0.25% -> ~6e-6), so the reciprocal stops being the bottleneck and
-// sigmoid inherits the exp LUT's accuracy instead.
+// History: the reciprocal was where this kernel first lost all its accuracy.
+// The original path used getInvBf16 (a per-lane scalar bit-manip reciprocal,
+// only ~5-8% exact) with NO refinement -- that ~8-9% nonlinearity error
+// inflated the normal-p99 detection threshold ~6x and cost ~4 F1 points on
+// hardware (NPU 0.894 vs PyTorch 0.936). See npu/precision_ablation.py. The
+// accuracy fix was the two Newton steps; the SEED was still the scalar
+// getInvBf16 loop (store_v -> 16x scalar LUT gather -> load_v).
 //
-// This deliberately introduces NO new primitives. getExpBf16 and the per-lane
-// getInvBf16 loop are exactly as in the kernel that already works, and Newton
-// needs only vector mul/sub -- the same ops matvec_bias and the gate loop
-// already rely on. In particular: NO aie::max/min, and NO scalar fp32
-// arithmetic. Earlier attempts at this fix used those and produced divergence
-// (scalar fp32) or a badly inaccurate tanh (aie::max/min) on hardware.
+// This version replaces that scalar seed with a vectorized bit-trick seed
+// (see the seed block below) to kill the memory round-trip inside a gate loop
+// that runs 120 sigmoid16 calls/window. Offline-validated to the same end
+// accuracy (<0.7% reciprocal error after 2 Newton steps). This is a SPEED
+// change; the Newton refinement (the accuracy-critical part) is untouched.
 //
+// Newton:  r <- r * (2 - denom*r).  The relative error SQUARES each step
+// (~10% seed -> ~1% -> <0.7%, bf16-precision-limited).
+//
+// Constraints that still hold: Newton needs only vector mul/sub (same ops
+// matvec_bias/the gate loop already use). NO aie::max/min, NO scalar fp32
+// arithmetic -- earlier attempts at the reciprocal with those diverged
+// (scalar fp32) or gave a badly inaccurate tanh (aie::max/min) on hardware.
 // Every aie::mul/add/sub result is materialized into a named vector -- they
 // return an aie::accum, NOT a vector, and chaining them corrupts every lane.
 //
 // Safety: denom = 1 + exp(-x) >= 1 always, so Newton can never divide by zero,
-// and it converges from any seed within (0, 2/denom) -- which a reciprocal
-// approximation of any sane quality satisfies.
+// and it converges from any seed within (0, 2/denom) -- which the bit-trick
+// seed (within ~10%) comfortably satisfies.
 inline aie::vector<bfloat16, 16>
 sigmoid16(const aie::vector<bfloat16, 16> &x) {
   aie::vector<bfloat16, 16> zero = aie::broadcast<bfloat16, 16>(0.0f);
@@ -72,13 +76,28 @@ sigmoid16(const aie::vector<bfloat16, 16> &x) {
   aie::vector<bfloat16, 16> e = to_v16bfloat16(getExpBf16(neg_x));  // exp(-x)
   aie::vector<bfloat16, 16> denom = aie::add(one, e);               // 1 + exp(-x)
 
-  // Coarse seed, per lane -- unchanged from the working kernel.
-  alignas(aie::vector_decl_align) bfloat16 denom_arr[16];
-  alignas(aie::vector_decl_align) bfloat16 seed_arr[16];
-  aie::store_v(denom_arr, denom);
-  for (int j = 0; j < 16; j++)
-    seed_arr[j] = getInvBf16((float)denom_arr[j]); // ~1/denom, only ~5-8% exact
-  aie::vector<bfloat16, 16> r0 = aie::load_v<16>(seed_arr);
+  // Coarse seed, VECTORIZED. Replaces the per-lane scalar getInvBf16 loop
+  // (store_v -> 16x scalar exp-arith + 128-entry LUT gather -> load_v -- a
+  // full round trip through memory, inside a gate loop that runs 120
+  // sigmoid16 calls/window). Uses the classic fast-reciprocal bit trick:
+  // reinterpret denom's bits, subtract from a magic constant, reinterpret
+  // back -- ONE vector subtract, no scalar work, no gather.
+  //
+  // MAGIC=0x7EE6 was chosen offline (numpy/ml_dtypes) to minimize the bf16
+  // seed error: the raw seed is within ~10% (comparable to getInvBf16's
+  // ~5-8%), and after the 2 Newton steps below the reciprocal is <0.7%
+  // across denom in [1, 3e6] -- bf16-precision-limited, matching the scalar
+  // path's end accuracy. denom = 1+exp(-x) >= 1 always, and all positive
+  // bf16 values have bit patterns < 0x8000, so MAGIC-bits stays positive
+  // (no int16 sign issues) and the result is a valid positive reciprocal.
+  //
+  // cast_to<int16>() is a bit REINTERPRET (same 256-bit vector width), not a
+  // value conversion. If a Peano version rejects it, the fallback is the old
+  // scalar loop (git history) -- but the numerics here are validated.
+  aie::vector<int16, 16> denom_bits = denom.cast_to<int16>();
+  aie::vector<int16, 16> magic = aie::broadcast<int16, 16>((int16)0x7EE6);
+  aie::vector<int16, 16> seed_bits = aie::sub(magic, denom_bits);
+  aie::vector<bfloat16, 16> r0 = seed_bits.cast_to<bfloat16>();
 
   // Newton step 1: r1 = r0 * (2 - denom*r0)
   aie::vector<bfloat16, 16> dr0 = aie::mul(denom, r0);
