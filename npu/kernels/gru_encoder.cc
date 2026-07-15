@@ -88,10 +88,47 @@ void gru_encoder_impl(bfloat16 *restrict x_window, bfloat16 *restrict params,
   event1();
 }
 
+// DIAGNOSTIC ONLY -- does virtually no compute. Same (x_window, params,
+// latent) signature and buffer sizes as gru_encoder_bf16, and the SAME
+// ObjectFifo/DMA wiring (so x_window + params still get DMA'd in at full
+// size), but calls NO gru_step. Purpose: localize the encoder's ~145us
+// unexplained per-window overhead. If this shows ~the same low floor as the
+// decoder-noop (~32us/window), the overhead is in the gru_step/compute path
+// (a codegen problem). If it stays high, the overhead is dispatch/DMA of the
+// encoder's large x_window input (15x the decoder's input per dispatch).
+void gru_encoder_noop_impl(bfloat16 *restrict x_window, bfloat16 *restrict params,
+                           bfloat16 *restrict latent) {
+  event0();
+
+  constexpr int H = HIDDEN_DIM;
+  constexpr int T = SEQ_LEN;
+
+  // Touch params[0] so the params DMA/read isn't optimized away entirely.
+  bfloat16 touch = params[0];
+
+  for (int b = 0; b < BATCH; b++) {
+    bfloat16 *restrict x_window_b = x_window + b * T * INPUT_DIM;
+    bfloat16 *restrict latent_b = latent + b * H;
+
+    // Write latent from x_window (reads the input buffer so its DMA/load
+    // isn't dead, but does NO matvec/gate compute). +touch-touch keeps params
+    // live without changing the value.
+    for (int i = 0; i < H; i++)
+      latent_b[i] = x_window_b[i] + touch - touch;
+  }
+
+  event1();
+}
+
 extern "C" {
 
 void gru_encoder_bf16(bfloat16 *x_window, bfloat16 *params, bfloat16 *latent) {
   gru_encoder_impl(x_window, params, latent);
+}
+
+void gru_encoder_noop_bf16(bfloat16 *x_window, bfloat16 *params,
+                           bfloat16 *latent) {
+  gru_encoder_noop_impl(x_window, params, latent);
 }
 
 } // extern "C"
