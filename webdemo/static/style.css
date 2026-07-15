@@ -353,3 +353,28 @@ footer {
   margin: 2px 4px 0;
   max-width: 720px;
 }
+
+/* Reset button (demo re-show): quieter than the primary Run button. */
+.run-buttons {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.reset-btn {
+  font-size: 16px;
+  font-weight: 600;
+  padding: 12px 28px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--panel-border);
+  transition: color 0.15s, border-color 0.15s, transform 0.15s;
+}
+.reset-btn:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+  transform: translateY(-1px);
+}

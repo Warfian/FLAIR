@@ -2,6 +2,7 @@
   const $ = (id) => document.getElementById(id);
 
   const runBtn = $("run-btn");
+  const resetBtn = $("reset-btn");
   const windowCountEl = $("window-count");
   const mockBanner = $("mock-banner");
   const errorBanner = $("error-banner");
@@ -87,6 +88,8 @@
     const running = status.state === "running";
     runBtn.disabled = running;
     runBtn.textContent = running ? "Running…" : "Run the demo";
+    // Reset button appears once there's a finished/errored run to clear.
+    if (resetBtn) resetBtn.hidden = !(status.state === "done" || status.state === "error");
 
     if (!running && pollTimer) {
       clearInterval(pollTimer);
@@ -174,15 +177,33 @@
     poll();
   }
 
-  runBtn.addEventListener("click", startRun);
+  async function resetDemo() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    resultsEl.hidden = true;
+    errorBanner.hidden = true;
+    try {
+      const res = await fetch("/api/reset", { method: "POST" });
+      const status = await res.json();
+      render(status);  // reflect the idle state immediately
+    } catch (e) {
+      // If reset is refused (a run is in progress) or the server is down,
+      // just fall back to a normal status poll.
+      poll();
+    }
+  }
 
-  // Initial status fetch, and resume polling if a run is already underway
-  // (e.g. the page was reloaded mid-run).
-  poll().then(() => {
-    fetch("/api/status").then((r) => r.json()).then((status) => {
-      if (status.state === "running" && !pollTimer) {
-        pollTimer = setInterval(poll, 300);
-      }
-    });
-  });
+  runBtn.addEventListener("click", startRun);
+  if (resetBtn) resetBtn.addEventListener("click", resetDemo);
+
+  // On page load / refresh, reset to the just-booted state so the demo can be
+  // re-shown cleanly. If a run happens to be in progress, /api/reset is a
+  // no-op server-side and we resume polling it instead.
+  fetch("/api/status").then((r) => r.json()).then((status) => {
+    if (status.state === "running") {
+      if (!pollTimer) pollTimer = setInterval(poll, 300);
+      poll();
+    } else {
+      resetDemo();
+    }
+  }).catch(() => poll());
 })();

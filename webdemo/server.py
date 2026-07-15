@@ -100,6 +100,24 @@ def _reset_state(npz: str, seq_len: int, limit: int, mock: bool) -> None:
         })
 
 
+def _reset_to_idle() -> None:
+    """Return the demo to the just-booted idle state (used by the Reset button
+    and by page refresh, so it can be re-shown cleanly). No-op while a run is
+    in progress -- the worker threads are still writing _state, so clearing it
+    then would race them."""
+    with _lock:
+        if _state["state"] == "running":
+            return
+        _state.update({
+            "state": "idle",
+            "cpu": {"done": 0, "total": 0, "finished": False, "elapsed_ms": 0.0},
+            "npu": {"stage": None, "done": 0, "total": 0, "finished": False,
+                    "elapsed_ms": 0.0, "encoder_done": False},
+            "error": None,
+            "result": None,
+        })
+
+
 def _snapshot() -> dict:
     with _lock:
         s = copy.deepcopy(_state)
@@ -429,6 +447,10 @@ class DemoHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/reset":
+            _reset_to_idle()
+            self._send_json(_snapshot())
+            return
         if parsed.path != "/api/run":
             self.send_error(404)
             return
