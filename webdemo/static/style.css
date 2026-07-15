@@ -305,3 +305,42 @@ footer {
   font-size: 13px;
   text-align: center;
 }
+
+/* Fair batched-throughput comparison card (shown for transparency alongside
+   the single-stream headline speedup). */
+.throughput-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  margin-top: 22px;
+}
+.throughput-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+.throughput-rows {
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.throughput-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  color: var(--text-dim);
+}
+.throughput-row .metric-value { color: var(--text); font-weight: 700; font-size: 18px; }
+.throughput-verdict {
+  font-size: 15px;
+  font-weight: 600;
+  padding: 10px 12px;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+.tp-npu-wins { background: rgba(51, 224, 176, 0.14); color: var(--npu); }
+.tp-cpu-wins { background: rgba(90, 169, 255, 0.14); color: var(--cpu); }
+.throughput-note { color: var(--text-dim); font-size: 13px; line-height: 1.5; }

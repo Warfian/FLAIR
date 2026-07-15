@@ -34,7 +34,7 @@
       <div class="lane lane-cpu">
         <div class="lane-head">
           <span class="lane-label">CPU</span>
-          <span class="lane-sub">PyTorch, general-purpose processor</span>
+          <span class="lane-sub">PyTorch &middot; single-stream (batch&nbsp;=&nbsp;1, 1&nbsp;thread)</span>
         </div>
         <div class="progress-track">
           <div class="progress-fill" id="cpu-fill"></div>
@@ -48,7 +48,7 @@
       <div class="lane lane-npu">
         <div class="lane-head">
           <span class="lane-label">NPU</span>
-          <span class="lane-sub">Ryzen AI, dedicated AI accelerator</span>
+          <span class="lane-sub">Ryzen AI &middot; 4 cores in parallel, batched</span>
         </div>
         <div class="progress-track">
           <div class="progress-fill" id="npu-fill"></div>
@@ -66,7 +66,8 @@
     <section id="results" class="results" hidden>
       <div class="speedup-card">
         <div class="speedup-number"><span id="speedup-value">&mdash;</span>&times;</div>
-        <div class="speedup-caption">faster on the NPU</div>
+        <div class="speedup-caption">faster on the NPU &mdash; single-stream latency<br>
+          <small>(CPU one window at a time, the real-time edge case)</small></div>
       </div>
 
       <div class="metric-grid">
@@ -87,6 +88,26 @@
         </div>
       </div>
 
+      <div id="throughput-card" class="throughput-card" hidden>
+        <div class="throughput-title">Fair comparison: batched throughput (both sides parallel)</div>
+        <div class="throughput-rows">
+          <div class="throughput-row">
+            <span class="tag tag-npu">NPU &middot; 4 cores</span>
+            <span><span id="tp-npu" class="metric-value">&mdash;</span> &micro;s/window</span>
+          </div>
+          <div class="throughput-row">
+            <span class="tag tag-cpu">CPU &middot; batched, <span id="tp-threads">&mdash;</span> threads</span>
+            <span><span id="tp-cpu" class="metric-value">&mdash;</span> &micro;s/window</span>
+          </div>
+        </div>
+        <div id="tp-verdict" class="throughput-verdict">&mdash;</div>
+        <div class="throughput-note">
+          The big number above is <em>single-stream</em> (CPU one window at a
+          time). This panel is the apples-to-apples case: both the CPU and NPU
+          processing many windows in parallel at once.
+        </div>
+      </div>
+
       <div class="examples-wrap">
         <h2>A few traffic windows, up close</h2>
         <table class="examples-table">
@@ -100,7 +121,7 @@
   </main>
 
   <footer>
-    <p>FLAIR (Flow-Level Autoencoder for Intrusion Recognition) &middot; WUSTL-IIoT sample dataset</p>
+    <p>FLAIR (Flow-Level Autoencoder for Intrusion Recognition) &middot; WUSTL-IIoT full test set (real attacks) &middot; hidden=64 model on a 4-core Ryzen&nbsp;AI column</p>
   </footer>
 
   <script src="/app.js"></script>

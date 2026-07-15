@@ -200,7 +200,8 @@ def _mock_metrics(scores, labels) -> dict:
 # Orchestration: run CPU + NPU pipelines concurrently, combine results.
 # ---------------------------------------------------------------------------
 
-def _combine_results(cpu_result: dict, npu_result: dict) -> dict:
+def _combine_results(cpu_result: dict, npu_result: dict,
+                     show_throughput: bool = True) -> dict:
     cpu_ms = cpu_result["timings"]["cpu_inference_ms"]
     npu_ms = npu_result["timings"]["npu_inference_ms"]
     speedup = (cpu_ms / npu_ms) if npu_ms > 0 else float("nan")
@@ -229,7 +230,12 @@ def _combine_results(cpu_result: dict, npu_result: dict) -> dict:
                 "npu_score": npu_scores[i],
             })
 
-    return {
+    npu_us = npu_result["timings"]["npu_us_per_window"]
+    out = {
+        # This headline speedup is SINGLE-STREAM: CPU batch=1/1-thread (per-
+        # window latency) vs the NPU's batched 4-core pass. The frontend labels
+        # it as such. See "throughput" below for the fair batched-vs-batched
+        # comparison.
         "speedup": speedup,
         "cpu": {
             "inference_ms": cpu_ms,
@@ -239,7 +245,7 @@ def _combine_results(cpu_result: dict, npu_result: dict) -> dict:
         },
         "npu": {
             "inference_ms": npu_ms,
-            "us_per_window": npu_result["timings"]["npu_us_per_window"],
+            "us_per_window": npu_us,
             "encoder_ms": npu_result["timings"]["encoder_ms"],
             "decoder_ms": npu_result["timings"]["decoder_ms"],
             "auc": npu_result["metrics"].get("npu_auc"),
@@ -251,9 +257,27 @@ def _combine_results(cpu_result: dict, npu_result: dict) -> dict:
         "examples": examples,
     }
 
+    # Fair batched-vs-batched THROUGHPUT comparison (both sides parallel):
+    # CPU batched + full threads vs NPU 4-core. Included unless the operator
+    # passed --hide-throughput-baseline. `cpu_batched_faster` lets the
+    # frontend render honestly either way.
+    tp = cpu_result.get("throughput")
+    if show_throughput and tp:
+        cpu_bt = tp.get("cpu_batched_us_per_window")
+        out["throughput"] = {
+            "cpu_batched_us_per_window": cpu_bt,
+            "npu_us_per_window": npu_us,
+            "cpu_threads": tp.get("cpu_threads"),
+            "batch_size": tp.get("batch_size"),
+            "npu_speedup": (cpu_bt / npu_us) if (cpu_bt and npu_us) else float("nan"),
+            "cpu_batched_faster": bool(cpu_bt and npu_us and cpu_bt < npu_us),
+        }
+    return out
+
 
 def _run_demo(npz: str, seq_len: int, limit: int, mock: bool,
-              xrt_inc_dir: Optional[str], xrt_lib_dir: Optional[str]) -> None:
+              xrt_inc_dir: Optional[str], xrt_lib_dir: Optional[str],
+              show_throughput: bool = True) -> None:
     _reset_state(npz, seq_len, limit, mock)
 
     cpu_result: dict = {}
@@ -278,11 +302,23 @@ def _run_demo(npz: str, seq_len: int, limit: int, mock: bool,
         try:
             if mock:
                 cpu_result.update(_mock_cpu_pipeline(npz, seq_len, limit, on_progress=cpu_progress))
+                # Mock a fair-throughput CPU number ~4x the single-stream one
+                # (batched + multithreaded amortizes batch=1 overhead).
+                cpu_result["throughput"] = {
+                    "cpu_batched_us_per_window":
+                        cpu_result["timings"]["cpu_us_per_window"] / 4.0,
+                    "cpu_threads": 8, "batch_size": 1024,
+                }
             else:
-                from demo_backend import run_cpu_pipeline
+                from demo_backend import run_cpu_pipeline, run_cpu_batched_throughput
                 cpu_result.update(run_cpu_pipeline(
                     npz_path=npz, seq_len=seq_len, limit=limit, on_progress=cpu_progress,
                 ))
+                # Fair-throughput CPU baseline (batched + full threads), run
+                # after the single-stream pass so the race UI stays clean.
+                cpu_result["throughput"] = run_cpu_batched_throughput(
+                    npz_path=npz, seq_len=seq_len, limit=limit,
+                )
         except Exception as e:  # noqa: BLE001
             errors.append(("cpu", str(e)))
         finally:
@@ -326,7 +362,7 @@ def _run_demo(npz: str, seq_len: int, limit: int, mock: bool,
             _state["error"] = "; ".join(f"{who}: {msg}" for who, msg in errors)
             return
         try:
-            combined = _combine_results(cpu_result, npu_result)
+            combined = _combine_results(cpu_result, npu_result, show_throughput)
         except Exception as e:  # noqa: BLE001
             _state["state"] = "error"
             _state["error"] = f"combine: {e}"
@@ -409,7 +445,8 @@ class DemoHandler(http.server.BaseHTTPRequestHandler):
 
         t = threading.Thread(
             target=_run_demo,
-            args=(npz, seq_len, limit, self.args.mock, self.args.xrt_inc_dir, self.args.xrt_lib_dir),
+            args=(npz, seq_len, limit, self.args.mock, self.args.xrt_inc_dir,
+                  self.args.xrt_lib_dir, not self.args.hide_throughput_baseline),
             daemon=True,
         )
         t.start()
@@ -429,6 +466,11 @@ def main() -> None:
     p.add_argument("--mock", action="store_true",
                    help="fabricate results with the stdlib only; for UI dev "
                         "without torch/ml_dtypes/NPU installed")
+    p.add_argument("--hide-throughput-baseline", action="store_true",
+                   help="omit the fair batched+multithreaded CPU throughput "
+                        "comparison from the results (it is shown by default "
+                        "for transparency; hide it only if you've decided the "
+                        "single-stream framing is the one you're presenting)")
     args = p.parse_args()
 
     with _lock:

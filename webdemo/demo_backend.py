@@ -305,3 +305,40 @@ def run_cpu_pipeline(
         },
         "metrics": {"auc": roc_auc(scores, y), "f1": f1_at_percentile(scores, y)[0]},
     }
+
+
+def run_cpu_batched_throughput(
+    npz_path: str = str(_NPZ),
+    seq_len: int = SEQ_LEN,
+    limit: int = 5000,
+    ckpt_path: Optional[str] = None,
+    batch_size: int = 1024,
+    **_kw,
+) -> dict:
+    """FAIR-THROUGHPUT CPU baseline: PyTorch over ALL windows in batched chunks,
+    with the CPU's full multi-threaded BLAS (default thread count) -- the
+    opposite regime from run_cpu_pipeline's single-stream batch=1/1-thread.
+
+    This is the apples-to-apples comparison for the NPU's BATCHED 4-core
+    throughput (both sides batched + parallel). Timing only -- scores are
+    identical to the batch=1 path, so we don't recompute metrics."""
+    import torch
+    model, _sd, X_num, X_cat, _y, N = load_model_and_data(npz_path, limit, ckpt_path)
+    X_num, X_cat = X_num[:, :seq_len], X_cat[:, :seq_len]
+    x_num_t, x_cat_t = torch.from_numpy(X_num), torch.from_numpy(X_cat)
+
+    # Use the CPU's full threading here (unlike the single-stream path).
+    with torch.no_grad():
+        model.anomaly_score(x_num_t[:min(8, N)], x_cat_t[:min(8, N)])  # warm BLAS
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        for i in range(0, N, batch_size):
+            model.anomaly_score(x_num_t[i:i + batch_size], x_cat_t[i:i + batch_size])
+    total_ms = (time.perf_counter() - t0) * 1000.0
+
+    return {
+        "cpu_batched_ms": total_ms,
+        "cpu_batched_us_per_window": (total_ms * 1000.0 / N) if N else 0.0,
+        "cpu_threads": torch.get_num_threads(),
+        "batch_size": batch_size,
+    }

@@ -89,6 +89,28 @@
       ? (r.npu.corr_vs_pytorch * 100).toFixed(1) + "%"
       : "—";
 
+    const tp = r.throughput;
+    const tpCard = $("throughput-card");
+    if (tp && tp.cpu_batched_us_per_window != null && tp.npu_us_per_window != null) {
+      tpCard.hidden = false;
+      $("tp-npu").textContent = tp.npu_us_per_window.toFixed(1);
+      $("tp-cpu").textContent = tp.cpu_batched_us_per_window.toFixed(1);
+      $("tp-threads").textContent = tp.cpu_threads != null ? tp.cpu_threads : "—";
+      const verdict = $("tp-verdict");
+      // Honest verdict either way: npu_speedup = cpu_batched / npu (>1 -> NPU wins).
+      if (tp.cpu_batched_faster) {
+        const ratio = tp.npu_speedup > 0 ? (1 / tp.npu_speedup) : NaN;
+        verdict.textContent = `Batched, the CPU is ${ratio.toFixed(1)}× faster here — `
+          + `the NPU's real edge is power efficiency and offloading the CPU, not raw batched speed.`;
+        verdict.className = "throughput-verdict tp-cpu-wins";
+      } else {
+        verdict.textContent = `The NPU is ${tp.npu_speedup.toFixed(1)}× faster even batched-vs-batched.`;
+        verdict.className = "throughput-verdict tp-npu-wins";
+      }
+    } else {
+      tpCard.hidden = true;
+    }
+
     const body = $("examples-body");
     body.innerHTML = "";
     (r.examples || []).forEach((ex) => {
